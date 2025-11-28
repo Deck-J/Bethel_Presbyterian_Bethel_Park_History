@@ -77,6 +77,10 @@ jobs:
           lfs: false         # don't auto checkout big LFS files
           fetch-depth: 1
 
+      - name: Set up Git LFS
+        run: |
+          git lfs install --local
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -154,11 +158,9 @@ jobs:
             echo "LFS include spec : $INCLUDE_SPEC"
             echo "LFS include files: ${INCLUDE_FILES[*]}"
 
-            echo "Fetching LFS objects for batch..."
-            git lfs fetch origin --include="$INCLUDE_SPEC" --exclude=""
-
-            echo "Checking out LFS files for batch..."
-            git lfs checkout "${INCLUDE_FILES[@]}"
+            echo "Pulling LFS objects for batch (fetch + checkout)..."
+            # This both downloads the objects and replaces pointer files
+            git lfs pull origin main --include="$INCLUDE_SPEC" --exclude=""
 
             echo "Running OCR script for batch $BATCH_START–$BATCH_END..."
             START_PAGE="$BATCH_START" END_PAGE="$BATCH_END" python ocr_script.py
