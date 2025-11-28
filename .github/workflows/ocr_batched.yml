@@ -137,21 +137,34 @@ jobs:
             echo "Processing batch: $BATCH_START to $BATCH_END"
             echo "---------------------------------------------"
 
-            INCLUDE_PATHS=""
+            # Build both a pattern list (comma-separated) and a file list (space-separated)
+            INCLUDE_FILES=()
+            INCLUDE_SPEC=""
+
             for i in $(seq "$BATCH_START" "$BATCH_END"); do
-              INCLUDE_PATHS="$INCLUDE_PATHS pages/page-$i.png"
+              file="pages/page-$i.png"
+              INCLUDE_FILES+=("$file")
+              if [ -z "$INCLUDE_SPEC" ]; then
+                INCLUDE_SPEC="$file"
+              else
+                INCLUDE_SPEC="$INCLUDE_SPEC,$file"
+              fi
             done
 
-            echo "Fetching LFS objects for: $INCLUDE_PATHS"
-            git lfs fetch origin --include="$INCLUDE_PATHS" --exclude=""
-            git lfs checkout $INCLUDE_PATHS
+            echo "LFS include spec : $INCLUDE_SPEC"
+            echo "LFS include files: ${INCLUDE_FILES[*]}"
+
+            echo "Fetching LFS objects for batch..."
+            git lfs fetch origin --include="$INCLUDE_SPEC" --exclude=""
+
+            echo "Checking out LFS files for batch..."
+            git lfs checkout "${INCLUDE_FILES[@]}"
 
             echo "Running OCR script for batch $BATCH_START–$BATCH_END..."
-            # Override START_PAGE / END_PAGE just for this python run
             START_PAGE="$BATCH_START" END_PAGE="$BATCH_END" python ocr_script.py
 
             echo "Cleaning batch PNGs to free disk..."
-            rm -f $INCLUDE_PATHS || true
+            rm -f "${INCLUDE_FILES[@]}" || true
 
             CUR=$((BATCH_END + 1))
           done
