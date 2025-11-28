@@ -1,4 +1,4 @@
-name: Bethel OCR & Extraction (Batched)
+ame: Bethel OCR & Extraction (Batched via Google Drive)
 
 on:
   workflow_dispatch:
@@ -32,6 +32,7 @@ jobs:
     env:
       # Secrets
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GDRIVE_FILE_ID: ${{ secrets.GDRIVE_FILE_ID }}
 
       # Directories / files (must match ocr_script.py)
       PAGES_DIR: pages
@@ -68,28 +69,38 @@ jobs:
       WF_END_PAGE: ${{ github.event.inputs.end_page }}
       DRY_RUN: ${{ github.event.inputs.dry_run }}
 
-    steps:
-      - name: Checkout repository (no automatic LFS download)
-        uses: actions/checkout@v4
-        env:
-          GIT_LFS_SKIP_SMUDGE: 1
-        with:
-          lfs: false         # don't auto checkout big LFS files
-          fetch-depth: 1
+      # Local zip path
+      PAGES_ZIP_PATH: pages_all.zip
 
-      - name: Set up Git LFS
-        run: |
-          git lfs install --local
+    steps:
+      - name: Checkout repository (no LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies (including gdown)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install gdown
+
+      - name: Download pages archive from Google Drive
+        run: |
+          set -euo pipefail
+          if [ -z "${GDRIVE_FILE_ID:-}" ]; then
+            echo "ERROR: GDRIVE_FILE_ID secret is not set."
+            exit 1
+          fi
+
+          echo "Downloading pages archive from Google Drive (file ID: $GDRIVE_FILE_ID)..."
+          gdown --id "$GDRIVE_FILE_ID" -O "$PAGES_ZIP_PATH"
+          ls -lh "$PAGES_ZIP_PATH"
 
       - name: Run OCR in batches
         shell: bash
@@ -103,6 +114,12 @@ jobs:
           DRY_RUN_VAL="${DRY_RUN:-false}"
 
           echo "Dry run mode (env DRY_RUN): $DRY_RUN_VAL"
+          echo "Pages zip path: $PAGES_ZIP_PATH"
+
+          if [ ! -f "$PAGES_ZIP_PATH" ]; then
+            echo "ERROR: Pages zip '$PAGES_ZIP_PATH' not found."
+            exit 1
+          fi
 
           if [ "$TOTAL_PAGES" -le 0 ]; then
             echo "ERROR: WF_TOTAL_PAGES must be > 0 (got '$TOTAL_PAGES')."
@@ -129,6 +146,8 @@ jobs:
             exit 1
           fi
 
+          mkdir -p "$PAGES_DIR"
+
           CUR="$START"
           while [ "$CUR" -le "$END" ]; do
             BATCH_START="$CUR"
@@ -141,26 +160,17 @@ jobs:
             echo "Processing batch: $BATCH_START to $BATCH_END"
             echo "---------------------------------------------"
 
-            # Build both a pattern list (comma-separated) and a file list (space-separated)
+            # Build list of files for this batch
             INCLUDE_FILES=()
-            INCLUDE_SPEC=""
-
             for i in $(seq "$BATCH_START" "$BATCH_END"); do
-              file="pages/page-$i.png"
-              INCLUDE_FILES+=("$file")
-              if [ -z "$INCLUDE_SPEC" ]; then
-                INCLUDE_SPEC="$file"
-              else
-                INCLUDE_SPEC="$INCLUDE_SPEC,$file"
-              fi
+              INCLUDE_FILES+=("pages/page-$i.png")
             done
 
-            echo "LFS include spec : $INCLUDE_SPEC"
-            echo "LFS include files: ${INCLUDE_FILES[*]}"
+            echo "Extracting files from zip for batch:"
+            printf '  %s\n' "${INCLUDE_FILES[@]}"
 
-            echo "Pulling LFS objects for batch (fetch + checkout)..."
-            # This both downloads the objects and replaces pointer files
-            git lfs pull origin main --include="$INCLUDE_SPEC" --exclude=""
+            # Extract only the needed files for this batch
+            unzip -q "$PAGES_ZIP_PATH" "${INCLUDE_FILES[@]}"
 
             echo "Running OCR script for batch $BATCH_START–$BATCH_END..."
             START_PAGE="$BATCH_START" END_PAGE="$BATCH_END" python ocr_script.py
