@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Virtual envs
+.venv/
+venv/
+
+# OCR outputs (you may choose to commit these on branches)
+per_page/
+ocr_output/
+page_complexity.csv
+
+# OS junk
+.DS_Store
+Thumbs.db

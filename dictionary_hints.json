@@ -1,0 +1,111 @@
+{
+  "names": [
+    "Oliver Miller",
+    "James Miller",
+    "John McMillan",
+    "Samuel Kiddoo",
+    "William Kiddoo",
+    "John Woods",
+    "Joseph Woods"
+  ],
+  "church_roles": [
+    "Elder",
+    "Ruling Elder",
+    "Deacon",
+    "Pastor",
+    "Minister",
+    "Communicant",
+    "Non-communicant",
+    "Member"
+  ],
+  "church_terms": [
+    "communicant",
+    "communicants",
+    "non-communicants",
+    "session",
+    "ruling elder",
+    "Bethel Church"
+  ],
+  "places": [
+    "Bethel",
+    "Pittsburgh",
+    "Washington County",
+    "Allegheny County"
+  ],
+  "military_terms": [
+    "Private",
+    "Lieut",
+    "Lieutenant",
+    "Lt.",
+    "Capt.",
+    "Captain",
+    "Ensign",
+    "Sergeant",
+    "Ranger",
+    "Militia",
+    "Virginia Line",
+    "Washington County Militia",
+    "Revolutionary soldier",
+    "Union",
+    "Confederate"
+  ],
+  "fuzzy_name_variants": {
+    "Kiddoo": [
+      "Kidoo",
+      "Kiddo",
+      "Kiddoe",
+      "Kiddow",
+      "Kidlow",
+      "Kiddco",
+      "Kiddao",
+      "Kiddon",
+      "Kidlas",
+      "Kiddale"
+    ],
+    "Woods": [
+      "Wood",
+      "Wodds",
+      "Wods",
+      "Woode",
+      "Woodes",
+      "Woods.",
+      "Wods.",
+      "Woobs"
+    ],
+    "McCully": [
+      "McCulley",
+      "McCuly",
+      "Mc Cully",
+      "McCully.",
+      "M’Cully",
+      "Mc-Cully"
+    ],
+    "McKee": [
+      "McKey",
+      "McKie",
+      "Mc Kee",
+      "McKee.",
+      "M’Kee"
+    ],
+    "Johnston": [
+      "Johnstone",
+      "Johnstun",
+      "Johnfton",
+      "Johnston.",
+      "Johnstn"
+    ],
+    "Hultz": [
+      "Hultz.",
+      "Hults",
+      "Hulz",
+      "Hulze",
+      "Hultze"
+    ],
+    "Marshall": [
+      "Marshal",
+      "Marshel",
+      "Marschell",
+      "Marshl"
+    ]
+  }
+}

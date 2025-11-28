@@ -1,0 +1,173 @@
+name: Bethel OCR & Extraction
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_page:
+        description: "First page number to process (optional, e.g., 1)"
+        required: false
+        default: ""
+      end_page:
+        description: "Last page number to process (optional, e.g., 150)"
+        required: false
+        default: ""
+      use_strips:
+        description: "Force strips (1) or let auto mode decide (0 = auto)"
+        required: false
+        default: "0"
+      strips_per_page:
+        description: "Base strips per page (used when strips are enabled)"
+        required: false
+        default: "6"
+      max_strips_per_page:
+        description: "Max strips per super-dense page"
+        required: false
+        default: "8"
+      max_long_dim:
+        description: "Max image dimension (pixels) after downscaling"
+        required: false
+        default: "2048"
+      max_total_pixels:
+        description: "Max total pixels after downscaling"
+        required: false
+        default: "20000000"
+
+jobs:
+  run-ocr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # up to 6 hours; adjust if you want shorter runs
+
+    env:
+      # OpenAI key from repo secrets
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # Script configuration (same env names as your script)
+      PAGES_DIR: pages
+      OUTPUT_JSONL: ocr_all_pages.jsonl
+      PER_PAGE_DIR: per_page
+      OCR_OUTPUT_DIR: ocr_output
+
+      # Page range (optional)
+      START_PAGE: ${{ github.event.inputs.start_page }}
+      END_PAGE: ${{ github.event.inputs.end_page }}
+
+      # Strip / tiling logic
+      USE_STRIPS: ${{ github.event.inputs.use_strips }}
+      AUTO_STRIP_MODE: "1"
+      STRIPS_PER_PAGE: ${{ github.event.inputs.strips_per_page }}
+      MAX_STRIPS_PER_PAGE: ${{ github.event.inputs.max_strips_per_page }}
+      STRIP_OVERLAP: "20"
+
+      # Complexity thresholds
+      EASY_INK_THRESHOLD: "0.05"
+      DENSE_INK_THRESHOLD: "0.12"
+      SUPER_DENSE_INK_THRESHOLD: "0.18"
+
+      # Downscaling limits
+      MAX_LONG_DIM: ${{ github.event.inputs.max_long_dim }}
+      MAX_TOTAL_PIXELS: ${{ github.event.inputs.max_total_pixels }}
+
+      # Models
+      VISION_MODEL: "gpt-4o"
+      TEXT_MODEL: "gpt-4o-mini"
+
+      # Concurrency
+      MAX_WORKERS: "4"
+
+      # Complexity log
+      COMPLEXITY_LOG: "page_complexity.csv"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compute run branch name
+        id: branchname
+        run: |
+          BRANCH_NAME="ocr-run-${GITHUB_RUN_ID}"
+          echo "BRANCH_NAME=${BRANCH_NAME}"
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_ENV
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Create and switch to run branch
+        run: |
+          git status
+          echo "Creating new branch: ${BRANCH_NAME}"
+          git checkout -b "${BRANCH_NAME}"
+
+      - name: Show configuration
+        run: |
+          echo "Branch:             ${BRANCH_NAME}"
+          echo "PAGES_DIR:          $PAGES_DIR"
+          echo "OUTPUT_JSONL:       $OUTPUT_JSONL"
+          echo "PER_PAGE_DIR:       $PER_PAGE_DIR"
+          echo "OCR_OUTPUT_DIR:     $OCR_OUTPUT_DIR"
+          echo "START_PAGE:         ${START_PAGE}"
+          echo "END_PAGE:           ${END_PAGE}"
+          echo "USE_STRIPS:         $USE_STRIPS"
+          echo "AUTO_STRIP_MODE:    $AUTO_STRIP_MODE"
+          echo "STRIPS_PER_PAGE:    $STRIPS_PER_PAGE"
+          echo "MAX_STRIPS_PER_PAGE:$MAX_STRIPS_PER_PAGE"
+          echo "MAX_LONG_DIM:       $MAX_LONG_DIM"
+          echo "MAX_TOTAL_PIXELS:   $MAX_TOTAL_PIXELS"
+
+      - name: Run OCR pipeline
+        run: |
+          python ocr_script.py
+
+      - name: List output files
+        run: |
+          echo "Repo files after OCR:"
+          ls -R
+          echo
+          echo "Size of JSONL:"
+          ls -lh "$OUTPUT_JSONL" || echo "No JSONL yet"
+          echo "Size of complexity log:"
+          ls -lh "$COMPLEXITY_LOG" || echo "No complexity log"
+
+      - name: Commit OCR results to run branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            "$OUTPUT_JSONL" \
+            "$COMPLEXITY_LOG" \
+            "$OCR_OUTPUT_DIR" \
+            "$PER_PAGE_DIR" || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else:
+            git commit -m "OCR results for ${BRANCH_NAME}"
+          fi
+
+      - name: Push run branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push origin "${BRANCH_NAME}" || echo "No changes to push (maybe empty commit)."
+
+      - name: Upload OCR outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bethel-ocr-output-${{ steps.branchname.outputs.branch_name }}
+          path: |
+            ocr_all_pages.jsonl
+            ocr_output/
+            per_page/
+            page_complexity.csv
+          if-no-files-found: warn
