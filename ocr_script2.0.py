@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bethel OCR / ICR Pipeline
-Version: 2.32 (Adaptive + Quadrants + Parallel + Safe Prompts + Refusal & Commentary Scrubbers)
+Version: 2.36 (Adaptive + Quadrants + FIFO API Queue + Events w/ People & Places)
 
 Features:
 - Vision OCR via OpenAI (gpt-4o-mini / gpt-4o)
@@ -22,9 +22,15 @@ Features:
     * If none → wrap raw text into minimal JSON stub
 - Local post-processing:
     * Places / people / events sweeper (lightweight)
+    * Events linked to people (full name / surname) and places, with dates/years
+    * Ambiguous names (e.g. Elizabeth) down-ranked as places if corpus shows
+      they overwhelmingly occur as first names, not towns
 - Page-level parallelism with ThreadPoolExecutor
 - Refusal / safety boilerplate scrubber on content/raw_text
-- Commentary / STRIP header scrubber on content/raw_text
+- Global FIFO queue for ALL OpenAI calls:
+    * Exactly one in-flight API call at a time
+    * Strictly ordered across all pages/quadrants
+    * Exponential backoff for rate limits / transient failures
 """
 
 import os
@@ -39,16 +45,14 @@ import threading
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+from threading import Thread, Event
 
 from dotenv import load_dotenv
 from PIL import Image
 from openai import OpenAI
 import numpy as np
 import cv2
-
-# Hard cap on concurrent OpenAI calls (pages × quadrants combined)
-MAX_PARALLEL_CALLS = int(os.getenv("OCR_MAX_PARALLEL_CALLS", "4"))
-API_SEMAPHORE = threading.Semaphore(MAX_PARALLEL_CALLS)
 
 # Suppress decompression bomb warnings but raise pixel limit
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
@@ -89,11 +93,116 @@ MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "4"))
 
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "90000000"))
 
-TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.32-adaptive-quadrants"
+TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.36-adaptive-quadrants-fifo-events"
 
 LAYOUT_TILE_CONFIG = {
     "default": (2, 3),   # rows, cols
 }
+
+# -------------------------
+# Global FIFO API queue
+# -------------------------
+
+GLOBAL_API_QUEUE: "Queue[tuple]" = Queue()
+GLOBAL_API_WORKER_STARTED = False
+GLOBAL_API_WORKER_LOCK = threading.Lock()
+
+def _do_openai_call(client: OpenAI, model: str, messages: List[Dict[str, Any]]):
+    """
+    Actual OpenAI API call with exponential backoff for rate limits / transient errors.
+    Uses MAX_RETRIES as the cap on attempts.
+    """
+    delay = RETRY_SLEEP_SECONDS or 2.0
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                temperature=0.0,
+                messages=messages,
+            )
+        except Exception as e:
+            msg = str(e)
+            # crude but robust: look for rate-limit / 429 hints
+            is_rate_limit = (
+                "429" in msg or
+                "rate limit" in msg.lower() or
+                "too many requests" in msg.lower()
+            )
+            # transient-ish errors we might want to retry
+            is_transient = any(
+                kw in msg.lower()
+                for kw in ["timeout", "temporarily unavailable", "try again", "server error"]
+            )
+
+            if attempt < MAX_RETRIES and (is_rate_limit or is_transient):
+                logger.warning(
+                    f"[RATE_LIMIT/TRANSIENT] attempt {attempt} failed: {msg} "
+                    f"→ sleeping {delay:.1f}s then retry"
+                )
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+
+            # no retry or final attempt → re-raise
+            logger.error(f"[OPENAI_CALL] final failure on attempt {attempt}: {msg}")
+            raise
+
+    # Should be unreachable
+    raise RuntimeError("Unreachable: exhausted retries in _do_openai_call")
+
+def start_global_api_worker(client: OpenAI) -> None:
+    """
+    Start a single global worker thread that consumes tasks from GLOBAL_API_QUEUE.
+    Each task is a tuple: (callable, args, kwargs, promise_dict).
+    """
+    global GLOBAL_API_WORKER_STARTED
+
+    with GLOBAL_API_WORKER_LOCK:
+        if GLOBAL_API_WORKER_STARTED:
+            return
+        GLOBAL_API_WORKER_STARTED = True
+
+        def worker():
+            logger.info("[API_WORKER] Global API worker thread started")
+            while True:
+                task = GLOBAL_API_QUEUE.get()
+                if task is None:
+                    logger.info("[API_WORKER] Shutdown signal received")
+                    GLOBAL_API_QUEUE.task_done()
+                    break
+
+                func, args, kwargs, promise = task
+                try:
+                    result = func(*args, **kwargs)
+                    promise["result"] = result
+                except Exception as e:
+                    promise["error"] = e
+                finally:
+                    # wake up the waiting thread
+                    promise["event"].set()
+                    GLOBAL_API_QUEUE.task_done()
+
+        t = Thread(target=worker, daemon=True)
+        t.start()
+
+def enqueue_api_call(func, *args, **kwargs):
+    """
+    Put a single API call into the global FIFO queue and block until it's done.
+    Returns: the value that func(*args, **kwargs) produced or raises its exception.
+    """
+    event = Event()
+    promise = {"event": event, "result": None, "error": None}
+
+    GLOBAL_API_QUEUE.put((func, args, kwargs, promise))
+
+    # Blocking wait until worker finishes this task and signals via the Event
+    event.wait()
+
+    if promise["error"] is not None:
+        raise promise["error"]
+
+    return promise["result"]
 
 # -------------------------
 # Dictionaries / hints
@@ -172,6 +281,120 @@ COMBINED_SURNAMES = combined_list(DEFAULT_SURNAMES, HINTS.get("names"))
 COMBINED_PLACES = combined_list(DEFAULT_PLACES, HINTS.get("places"))
 COMBINED_CHURCH_TERMS = combined_list([], HINTS.get("church_terms"))
 COMBINED_MILITARY = combined_list(DEFAULT_MILITARY_KEYWORDS, HINTS.get("military_keywords"))
+
+# -------------------------
+# Ambiguous name/place frequency logic
+# -------------------------
+
+# Names that can be both people and places – we treat them cautiously as "places"
+AMBIGUOUS_PLACE_NAMES = {
+    "Elizabeth",
+    "Washington",
+    "Madison",
+    "Florence",
+    "Charlotte",
+}
+
+NAME_TOWN_STATS: Optional[Dict[str, Dict[str, int]]] = None
+
+def normalize_token(s: str) -> str:
+    """
+    Normalize tokens for loose comparison:
+    - strip punctuation
+    - collapse spaces
+    - title-case (Elizabeth, Washington)
+    """
+    if not isinstance(s, str):
+        return ""
+    s = s.strip().strip(",.;:()[]")
+    s = re.sub(r"\s+", " ", s)
+    return s.title()
+
+def build_name_town_stats() -> Dict[str, Dict[str, int]]:
+    """
+    Scan existing JSON outputs (MASTER_JSONL if present, otherwise page-*.json)
+    and build simple frequency counts for ambiguous tokens:
+      - how often they appear as FIRST NAMES in people.full_name
+      - how often they appear as places.name
+
+    This lets us down-rank things like "Elizabeth" as a place if, so far in the
+    corpus, it has only ever shown up as a first name and never as a town.
+    """
+    global NAME_TOWN_STATS
+    if NAME_TOWN_STATS is not None:
+        return NAME_TOWN_STATS
+
+    stats: Dict[str, Dict[str, int]] = {
+        name: {"as_person_first": 0, "as_place": 0}
+        for name in AMBIGUOUS_PLACE_NAMES
+    }
+
+    def _update_from_obj(obj: Dict[str, Any]) -> None:
+        # People → first names
+        for person in obj.get("people", []) or []:
+            if not isinstance(person, dict):
+                continue
+            full = person.get("full_name") or ""
+            if not isinstance(full, str) or not full.strip():
+                continue
+            tokens = full.strip().split()
+            if len(tokens) < 2:
+                continue
+            first = normalize_token(tokens[1])  # tokens[0] is usually honorific
+            if first in stats:
+                stats[first]["as_person_first"] += 1
+
+        # Places → names
+        for pl in obj.get("places", []) or []:
+            if isinstance(pl, dict):
+                nm = pl.get("name") or ""
+            else:
+                nm = pl
+            if not isinstance(nm, str) or not nm.strip():
+                continue
+            nm_norm = normalize_token(nm)
+            if nm_norm in stats:
+                stats[nm_norm]["as_place"] += 1
+
+    # Prefer master JSONL if it exists
+    if MASTER_JSONL.exists():
+        try:
+            with MASTER_JSONL.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    _update_from_obj(obj)
+        except Exception as e:
+            logger.warning(f"[NAME_TOWN_STATS] Failed reading MASTER_JSONL: {e}")
+
+    # Also scan per-page JSON to catch new runs or if MASTER_JSONL is missing
+    try:
+        for p in OUTPUT_DIR.glob("page-*.json"):
+            if p.name.endswith("_raw_broken.json"):
+                continue
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    obj = json.load(f)
+            except Exception:
+                continue
+            _update_from_obj(obj)
+    except Exception as e:
+        logger.warning(f"[NAME_TOWN_STATS] Failed scanning per-page JSON: {e}")
+
+    NAME_TOWN_STATS = stats
+    logger.info(
+        "[NAME_TOWN_STATS] Built ambiguous name/place stats: " +
+        ", ".join(
+            f"{name} P={counts['as_person_first']} / T={counts['as_place']}"
+            for name, counts in stats.items()
+        )
+    )
+    return NAME_TOWN_STATS
 
 # -------------------------
 # Page list w/ ranges
@@ -561,60 +784,6 @@ def scrub_refusals_in_data(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 # -------------------------
-# COMMENTARY / STRIP HEADER SCRUBBER
-# -------------------------
-
-STRIP_HEADER_RE = re.compile(
-    r"---\s*STRIP\s*\d+\s*/\s*\d+\s*---",
-    re.IGNORECASE
-)
-
-COMMENT_HEADER_RE = re.compile(
-    r"(Register\s*:.*?$)|"
-    r"(Baptism(?:s|al)?\s+Register.*?$)|"
-    r"(Christenings.*?$)|"
-    r"(Continuation\s+Page.*?$)|"
-    r"(Page\s+\d+\s+of\s+\d+.*?$)",
-    re.IGNORECASE | re.MULTILINE
-)
-
-MODEL_CHATTER_RE = re.compile(
-    r"(This appears to be.*?$)|"
-    r"(The following text shows.*?$)|"
-    r"(It seems like the page contains.*?$)",
-    re.IGNORECASE | re.MULTILINE
-)
-
-def strip_commentary(text: str) -> str:
-    """
-    Remove model-invented headers, 'STRIP X/Y' markers, and obvious explanatory commentary.
-    """
-    if not isinstance(text, str) or not text.strip():
-        return text
-
-    # Remove --- STRIP X/Y --- markers
-    text = STRIP_HEADER_RE.sub("", text)
-
-    # Remove section headers like "Register:", "Baptism …", etc.
-    text = COMMENT_HEADER_RE.sub("", text)
-
-    # Remove simple explanatory chatter
-    text = MODEL_CHATTER_RE.sub("", text)
-
-    # Clean extra whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
-
-def scrub_commentary_in_data(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply commentary scrubbing to key text fields in the page JSON.
-    """
-    for fld in ["content", "raw_text", "page_title", "notes"]:
-        if fld in data and isinstance(data[fld], str):
-            data[fld] = strip_commentary(data[fld])
-    return data
-
-# -------------------------
 # JSON extraction
 # -------------------------
 
@@ -715,7 +884,7 @@ def extract_json_from_markers(
     return data
 
 # -------------------------
-# Vision call
+# Vision call (now FIFO via global queue)
 # -------------------------
 
 def call_vision_for_tiles(
@@ -729,10 +898,14 @@ def call_vision_for_tiles(
     """
     Call the Vision model for one logical unit (whole page or one quadrant/region).
 
-    Concurrency is globally limited by API_SEMAPHORE so that the total number
-    of in-flight OpenAI calls across all pages/quadrants never exceeds
-    MAX_PARALLEL_CALLS.
+    IMPORTANT:
+    - All OpenAI calls go through a single global FIFO queue.
+    - Exactly one API call is in-flight at any time.
+    - Quadrants/regions across all pages are strictly serialized.
     """
+    # Ensure global worker exists
+    start_global_api_worker(client)
+
     sys_prompt = build_system_prompt()
     user_prompt = build_user_prompt(page_number, layout_type, quadrant_label)
 
@@ -746,68 +919,94 @@ def call_vision_for_tiles(
             },
         })
 
-    last_error: Optional[Exception] = None
-    assistant_text: str = ""
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": message_content},
+    ]
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        label = quadrant_label or "whole-page"
-        logger.info(f"Page {page_number} {label} attempt {attempt}")
+    label = quadrant_label or "whole-page"
+    logger.info(f"Page {page_number} {label}: enqueuing API call")
+
+    def _task():
+        logger.info(f"Page {page_number} {label}: starting API call (in worker)")
+        resp = _do_openai_call(client, model, messages)
+        msg = resp.choices[0].message
+
+        if isinstance(msg.content, str):
+            assistant_text = msg.content
+        else:
+            parts_text: List[str] = []
+            for part in msg.content:
+                if getattr(part, "type", None) == "text":
+                    parts_text.append(part.text)
+            assistant_text = "".join(parts_text)
+        return assistant_text.strip()
+
+    # enqueue FIFO, block until that one finishes
+    assistant_text = ""
+    try:
+        assistant_text = enqueue_api_call(_task)
+    except Exception as e:
+        logger.error(f"Page {page_number} {label}: API call failed: {e}")
+        raise
+
+    if not assistant_text:
+        raise ValueError(f"Empty assistant_text from model for page {page_number} {label}")
+
+    try:
+        data = extract_json_from_markers(
+            assistant_text,
+            page_number,
+            quadrant_label,
+        )
+        return data
+    except Exception as e:
+        # Debug dump of raw model output (best-effort)
         try:
-            # Global concurrency limiter for all API calls
-            with API_SEMAPHORE:
-                resp = client.chat.completions.create(
-                    model=model,
-                    temperature=0.0,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": message_content},
-                    ],
-                )
+            debug_label = quadrant_label or "whole"
+            debug_path = OUTPUT_DIR / f"page-{page_number}_{debug_label}_raw.txt"
+            with debug_path.open("w", encoding="utf-8") as dbg:
+                dbg.write(assistant_text or "")
+            logger.info(f"[DEBUG] Saved raw model output to {debug_path}")
+        except Exception as dbg_e:
+            logger.warning(f"[DEBUG] Failed to write debug output: {dbg_e}")
 
-            msg = resp.choices[0].message
-            if isinstance(msg.content, str):
-                assistant_text = msg.content
-            else:
-                parts_text: List[str] = []
-                for part in msg.content:
-                    if getattr(part, "type", None) == "text":
-                        parts_text.append(part.text)
-                assistant_text = "".join(parts_text)
-
-            assistant_text = assistant_text.strip()
-            if not assistant_text:
-                raise ValueError("Empty assistant_text from model")
-
-            data = extract_json_from_markers(
-                assistant_text,
-                page_number,
-                quadrant_label,
-            )
-            return data
-
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Attempt {attempt} failed: {e}")
-
-            # Debug dump of raw model output (best-effort)
-            try:
-                debug_label = quadrant_label or "whole"
-                debug_path = OUTPUT_DIR / f"page-{page_number}_{debug_label}_raw.txt"
-                with debug_path.open("w", encoding="utf-8") as dbg:
-                    dbg.write(assistant_text or "")
-                logger.info(f"[DEBUG] Saved raw model output to {debug_path}")
-            except Exception as dbg_e:
-                logger.warning(f"[DEBUG] Failed to write debug output: {dbg_e}")
-
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_SLEEP_SECONDS)
-
-    raise RuntimeError(f"Page {page_number} failed: {last_error}")
+        raise
 
 # -------------------------
-# Simple sweeper (optional light post-processing)
+# Simple sweeper (places, people, events with links)
 # -------------------------
+# Tokens that should never be treated as surnames (month names / abbreviations, etc.)
+MONTH_TOKENS = {
+    "jan", "jan.", "january",
+    "feb", "feb.", "february",
+    "mar", "mar.", "march",
+    "apr", "apr.", "april",
+    "may",
+    "jun", "jun.", "june",
+    "jul", "jul.", "july",
+    "aug", "aug.", "august",
+    "sep", "sept", "sept.", "september",
+    "oct", "oct.", "october",
+    "nov", "nov.", "november",
+    "dec", "dec.", "december",
+}
 
+# Extra words that often appear right after names but are NOT part of the name
+NON_NAME_TRAILERS = {
+    "ceased",
+    "removed",
+    "attending",
+    "daughter",
+    "son",
+    "wife",
+    "husband",
+    "baptists",
+    "church",
+    "cert.",
+    "ext",
+    "ex.",
+}
 DATE_RE = re.compile(
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|"
     r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
@@ -816,21 +1015,148 @@ DATE_RE = re.compile(
 YEAR_RE = re.compile(r"\b(17|18|19)\d{2}\b")
 
 def sweep_places(text: str, initial_places: List[str]) -> List[Dict[str, Any]]:
+    """
+    Very light place sweep:
+    - Start from COMBINED_PLACES hints
+    - Also include any initial_places passed in
+
+    Ambiguous names (Elizabeth, Washington, etc.) are down-ranked as places if,
+    in the existing corpus, they appear as FIRST NAMES far more often than as
+    place names (and never as places).
+    """
     found: Dict[str, str] = {}
     lowered = text.lower()
 
+    stats = build_name_town_stats()
+
+    def _should_skip_place(name: str) -> bool:
+        norm = normalize_token(name)
+        if norm not in AMBIGUOUS_PLACE_NAMES:
+            return False
+        info = stats.get(norm)
+        if not info:
+            return False
+        # If we've *never* seen it as a place but have seen it as a first name,
+        # treat it as "probably a person, not a town" and skip.
+        if info["as_place"] == 0 and info["as_person_first"] > 0:
+            logger.debug(
+                f"[PLACES] Skipping ambiguous place '{norm}' "
+                f"(person_first={info['as_person_first']}, place={info['as_place']})"
+            )
+            return True
+        return False
+
     for place in COMBINED_PLACES:
-        if place and place.lower() in lowered:
-            found[place] = ""
+        if not place:
+            continue
+        if place.lower() not in lowered:
+            continue
+        if _should_skip_place(place):
+            continue
+        found[place] = ""
 
     for p in initial_places:
-        if p and p not in found:
+        if not p:
+            continue
+        if _should_skip_place(p):
+            continue
+        if p not in found:
             found[p] = ""
 
     return [{"name": name, "notes": notes or None} for name, notes in sorted(found.items())]
 
 def sweep_people(text: str) -> List[Dict[str, Any]]:
-    # Very light people sweep: honorific + capitalized name
+    """
+    Very light people sweep: honorific + capitalized name.
+    Creates people objects that can later be linked to events.
+
+    Improvements:
+    - Collapse internal newlines so "Miss Mary J.\\nMartin" becomes "Miss Mary J. Martin".
+    - Strip trailing tokens that look like dates/months or obvious non-name words
+      (e.g. "June", "Dec.", "'86", "Ceased", "Removed").
+    """
+    people: Dict[str, Dict[str, Any]] = {}
+    honorific_union = "|".join(re.escape(h) for h in ALL_HONORIFICS)
+
+    # Match honorific + rest of the name-ish phrase on that line / local area.
+    # We still allow whitespace, but we will clean + clip tokens afterwards.
+    pattern = rf"\b(?:{honorific_union})\s+[A-Z][^\n]*"
+
+    for m in re.finditer(pattern, text):
+        raw_full = m.group(0)
+
+        # Collapse all whitespace (including newlines) down to single spaces
+        # e.g. "Miss Mary J.\\nMartin" → "Miss Mary J. Martin"
+        norm_full = " ".join(raw_full.split()).strip()
+        if not norm_full:
+            continue
+
+        tokens = norm_full.split()
+        if len(tokens) < 2:
+            # Honorific only, no name
+            continue
+
+        # Clip off trailing tokens that look like dates / months / junk
+        # e.g. "Mrs. Lucy O. June 13 1874" → tokens ["Mrs.", "Lucy", "O."]
+        def is_trailer(tok: str) -> bool:
+            t = tok.strip(".,;:()").lower()
+            if not t:
+                return True
+            if t in MONTH_TOKENS:
+                return True
+            if t in NON_NAME_TRAILERS:
+                return True
+            # Pure digits (years / days)
+            if re.fullmatch(r"\d+", t):
+                return True
+            # Apostrophe-year like '79, '86
+            if re.fullmatch(r"'?\d{2}", t):
+                return True
+            return False
+
+        # Walk backward from the end, trimming trailer tokens
+        end_idx = len(tokens) - 1
+        while end_idx >= 1 and is_trailer(tokens[end_idx]):
+            end_idx -= 1
+
+        tokens = tokens[: end_idx + 1]
+        if len(tokens) < 2:
+            # Nothing left but the honorific
+            continue
+
+        honorific = tokens[0]
+        name_parts = tokens[1:]
+        if not name_parts:
+            continue
+
+        # Full name after cleaning
+        full = " ".join([honorific] + name_parts)
+
+        # Derive given_name and surname heuristically
+        given_name = name_parts[0]
+        surname = name_parts[-1] if len(name_parts) >= 2 else None
+
+        # Example: "Mrs. Mary" → we probably don't know the surname, treat as None
+        # We already have surname=None in that case.
+
+        if full not in people:
+            people[full] = {
+                "full_name": full,
+                "given_name": given_name,
+                "surname": surname,
+                "honorific": honorific,
+                "church_role": None,
+                "is_military": any(h for h in HONORIFICS_MILITARY if honorific.startswith(h)),
+                "military_rank": None,
+                "notes": None,
+                "confidence": 0.7,
+            }
+
+    return list(people.values())
+    """
+    Very light people sweep: honorific + capitalized name.
+    Creates people objects that can later be linked to events.
+    """
     people: Dict[str, Dict[str, Any]] = {}
     honorific_union = "|".join(re.escape(h) for h in ALL_HONORIFICS)
     pattern = rf"\b(?:{honorific_union})\s+[A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+)*"
@@ -838,23 +1164,62 @@ def sweep_people(text: str) -> List[Dict[str, Any]]:
     for m in re.finditer(pattern, text):
         full = m.group(0).strip()
         if full not in people:
+            tokens = full.split()
+            given_name = None
+            surname = None
+            if len(tokens) >= 2:
+                given_name = tokens[1]
+                if len(tokens) >= 3:
+                    surname = tokens[-1]
             people[full] = {
                 "full_name": full,
-                "given_name": None,
-                "surname": None,
-                "honorific": full.split()[0],
+                "given_name": given_name,
+                "surname": surname,
+                "honorific": tokens[0],
                 "church_role": None,
-                "is_military": any(full.startswith(r) for r in HONORIFICS_MILITARY),
+                "is_military": any(tokens[0].startswith(r) for r in HONORIFICS_MILITARY),
                 "military_rank": None,
                 "notes": None,
                 "confidence": 0.7,
             }
     return list(people.values())
 
-def sweep_events(text: str, people: List[Dict[str, Any]], places: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _extract_year_from_string(s: str) -> Optional[int]:
+    m = YEAR_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except ValueError:
+        return None
+
+def sweep_events(
+    text: str,
+    people: List[Dict[str, Any]],
+    places: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Sweep for simple events and link them to people & places.
+
+    Event types:
+    - birth
+    - baptism
+    - marriage
+    - death
+    - other (e.g. regiment, battle)
+
+    For each event we attach:
+    - event_type
+    - date (best string snippet, if any)
+    - year (int, if we can find it)
+    - place (string, from known places, if any)
+    - people: list of { full_name, match_type }
+    """
     events: List[Dict[str, Any]] = []
+
+    # Split into pseudo-sentences / entries
     sentences = re.split(r"(?:\n{2,}|(?<=[.!?])\s+)", text)
-    place_names = [p["name"] for p in places]
+    place_names = [p["name"] for p in places if isinstance(p, dict) and "name" in p]
 
     for sent in sentences:
         s = sent.strip()
@@ -871,33 +1236,77 @@ def sweep_events(text: str, people: List[Dict[str, Any]], places: List[Dict[str,
             event_type = "marriage"
         elif any(w in lowered for w in ["died", "dead", "deceased", "killed"]):
             event_type = "death"
-        elif any(w in lowered for w in ["regiment", "company", "battle of"]):
+        elif any(w in lowered for w in ["regiment", "company", "battle of", "camp"]):
             event_type = "other"
 
         if not event_type:
             continue
 
-        date_match = DATE_RE.search(s) or YEAR_RE.search(s)
-        date = date_match.group(0) if date_match else None
+        # Date / year
+        date_match = DATE_RE.search(s)
+        if date_match:
+            date = date_match.group(0)
+        else:
+            year_match = YEAR_RE.search(s)
+            date = year_match.group(0) if year_match else None
 
+        year: Optional[int] = None
+        if date:
+            year = _extract_year_from_string(date)
+        if year is None:
+            # fallback: scan the whole sentence for a year if we only had month/day
+            year = _extract_year_from_string(s)
+
+        # Place inference: first known place name that appears in the sentence
         place_for_event = None
         for pl in place_names:
             if pl and pl.lower() in lowered:
                 place_for_event = pl
                 break
 
+        # People linking: by full_name first, then surname
+        people_for_event: Dict[str, Dict[str, Any]] = {}
+        for person in people:
+            full = person.get("full_name") or ""
+            if not full:
+                continue
+            tokens = full.split()
+            surname = tokens[-1] if len(tokens) >= 2 else None
+
+            # Full-name match (strongest)
+            if full in s:
+                people_for_event[full] = {
+                    "full_name": full,
+                    "match_type": "full",
+                }
+                continue
+
+            # Surname-only match (weaker, but still useful)
+            if surname:
+                if re.search(r"\b" + re.escape(surname) + r"\b", s):
+                    # Don't downgrade an existing full-name match
+                    if full not in people_for_event:
+                        people_for_event[full] = {
+                            "full_name": full,
+                            "match_type": "surname",
+                        }
+
         events.append({
             "event_type": event_type,
             "date": date,
+            "year": year,
             "place": place_for_event,
             "raw_entry": s,
             "normalized_summary": f"{event_type.capitalize()} event: {s[:180]}{' …' if len(s) > 180 else ''}",
-            "people": [],
+            "people": list(people_for_event.values()),
         })
 
     return events
 
 def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run places/people/event sweeps on the combined page content.
+    """
     text = data.get("content") or data.get("raw_text") or ""
     text = text if isinstance(text, str) else str(text)
 
@@ -937,7 +1346,8 @@ def ocr_page(
       - If no regions → fallback to single-call tiling
 
     Within dense path, quadrants/regions are processed in parallel via
-    an inner ThreadPoolExecutor.
+    an inner ThreadPoolExecutor, but the actual OpenAI calls are serialized
+    by the global FIFO API queue.
     """
     w, h = im.size
     area = w * h
@@ -1175,9 +1585,6 @@ def process_single_page(client: OpenAI, page: int) -> None:
 
         # scrub safety/refusal artifacts from LLM output
         data = scrub_refusals_in_data(data)
-
-        # scrub STRIP headers + model commentary from output
-        data = scrub_commentary_in_data(data)
 
         # local sweeper (places/people/events)
         data = apply_local_sweeper(data)
