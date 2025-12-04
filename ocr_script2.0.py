@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Bethel OCR / ICR Pipeline
-Version: 2.20 (Quadrant Variant)
+Version: 2.21 (Adaptive Quadrants)
 
 Features:
 - Vision OCR via OpenAI (gpt-4o-mini / gpt-4o or configured models)
 - Automatic layout + density detection per page
 - For ledger / super-dense pages:
-    - Split page into 2x2 quadrants
-    - 1 Vision API call per quadrant (4 smaller calls total)
-    - Merge quadrant JSON into a single page JSON
+    - Adaptive text-region detection (ink clusters)
+    - 1 Vision API call per text region (N smaller calls total)
+    - Merge region JSON into a single page JSON
 - For default pages:
     - Single Vision API call using tiled images (2x3)
 - LLM: OCR + light page metadata only (JSON inside ---BEGIN_JSON--- markers)
@@ -33,8 +33,14 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from PIL import Image
+import warnings           # ← system module, not part of PIL
+from PIL import Image     # ← only import Image from PIL
+
+warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
+Image.MAX_IMAGE_PIXELS = 300000000
 from openai import OpenAI
+import numpy as np
+import cv2
 
 # -------------------------
 # Logging
@@ -72,7 +78,7 @@ RETRY_SLEEP_SECONDS = float(os.getenv("OCR_RETRY_SLEEP", "4"))
 PAGE_LIST_ENV = os.getenv("PAGE_LIST", "").strip()
 
 # Version tag used in JSON
-TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.20-quadrants"
+TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.21-adaptive-quadrants"
 
 # Layout tile configurations for the "single-call" path
 LAYOUT_TILE_CONFIG = {
@@ -177,21 +183,43 @@ COMBINED_MILITARY = combined_list(DEFAULT_MILITARY_KEYWORDS, HINTS.get("military
 # -------------------------
 # Page list / layout
 # -------------------------
-
 def parse_page_list() -> List[int]:
+    """
+    Supports:
+      PAGE_LIST="1,2,3"
+      PAGE_LIST="1-5"
+      PAGE_LIST="1-5,7,9-12"
+    """
     if PAGE_LIST_ENV:
         out: List[int] = []
         for token in PAGE_LIST_ENV.split(","):
             token = token.strip()
             if not token:
                 continue
+
+            # Range support: e.g. "3-10"
+            if "-" in token:
+                try:
+                    start, end = token.split("-", 1)
+                    start_i = int(start)
+                    end_i = int(end)
+                    if start_i <= end_i:
+                        out.extend(range(start_i, end_i + 1))
+                    else:
+                        out.extend(range(end_i, start_i + 1))
+                except ValueError:
+                    logger.warning(f"[PAGE_LIST] Skipping invalid range: {token}")
+                continue
+
+            # Single page
             try:
                 out.append(int(token))
             except ValueError:
                 logger.warning(f"[PAGE_LIST] Skipping invalid value: {token}")
+
         return sorted(set(out))
 
-    # No explicit list: autodetect from pages/*.png with numeric stems
+    # No PAGE_LIST — auto-detect numbered files in `pages/`
     pages: List[int] = []
     for p in PAGES_DIR.glob("*.png"):
         try:
@@ -199,7 +227,6 @@ def parse_page_list() -> List[int]:
         except ValueError:
             continue
     return sorted(pages)
-
 
 def load_layout_overrides() -> Dict[int, str]:
     if not LAYOUT_OVERRIDES_PATH.exists():
@@ -266,6 +293,121 @@ def tile_image(img: Image.Image, rows: int, cols: int) -> List[Image.Image]:
             lower = h if r == rows - 1 else (r + 1) * th
             tiles.append(img.crop((left, upper, right, lower)))
     return tiles
+
+
+Box = Tuple[int, int, int, int]  # (left, top, right, bottom)
+
+
+def _merge_overlapping_boxes(
+    boxes: List[Box], max_gap_px: int = 20
+) -> List[Box]:
+    """
+    Simple merge of overlapping or very close boxes.
+    Used to combine nearby text blobs into larger regions.
+    """
+    if not boxes:
+        return []
+
+    # Sort by top, then left
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    merged: List[Box] = []
+
+    def overlap_or_close(a: Box, b: Box) -> bool:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+
+        # Expand a by max_gap_px in all directions
+        ax1e = ax1 - max_gap_px
+        ay1e = ay1 - max_gap_px
+        ax2e = ax2 + max_gap_px
+        ay2e = ay2 + max_gap_px
+
+        # Intersection
+        inter_x1 = max(ax1e, bx1)
+        inter_y1 = max(ay1e, by1)
+        inter_x2 = min(ax2e, bx2)
+        inter_y2 = min(ay2e, by2)
+        return inter_x1 <= inter_x2 and inter_y1 <= inter_y2
+
+    current = boxes[0]
+    for b in boxes[1:]:
+        if overlap_or_close(current, b):
+            x1 = min(current[0], b[0])
+            y1 = min(current[1], b[1])
+            x2 = max(current[2], b[2])
+            y2 = max(current[3], b[3])
+            current = (x1, y1, x2, y2)
+        else:
+            merged.append(current)
+            current = b
+    merged.append(current)
+    return merged
+
+
+def find_text_regions(
+    pil_img: Image.Image,
+    max_regions: int = 6,
+    min_area_ratio: float = 0.003,
+    pad: int = 20,
+) -> List[Box]:
+    """
+    Detect text-heavy regions on the page and return bounding boxes
+    in (left, top, right, bottom) format, suitable for PIL.crop.
+
+    - Works on full pages with blank margins / blank pages.
+    - Scales kernel sizes based on image dimensions.
+    - Merges overlapping / very close boxes.
+    """
+    rgb = pil_img.convert("RGB")
+    np_img = np.array(rgb)
+    gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+
+    h, w = gray.shape[:2]
+
+    # Binarize (Otsu) then invert so ink is white
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bin_img = 255 - th
+
+    # Morphological operations to join strokes into blobs
+    # Slightly smaller kernel than before to avoid merging entire page
+    kw = max(15, w // 80)   # was w // 50
+    kh = max(5, h // 250)   # was h // 200
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+
+    morphed = cv2.dilate(bin_img, kernel, iterations=1)
+    morphed = cv2.erode(morphed, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(
+        morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    min_area = min_area_ratio * (w * h)
+    boxes: List[Box] = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < min_area:
+            continue
+        # Do NOT discard very large regions; worst case we OCR the whole page.
+        boxes.append((x, y, x + bw, y + bh))
+
+    if not boxes:
+        return []
+
+    boxes = _merge_overlapping_boxes(boxes, max_gap_px=max(w, h) // 100)
+
+    boxes.sort(key=lambda b: (b[1], b[0]))
+
+    padded: List[Box] = []
+    for (x1, y1, x2, y2) in boxes[:max_regions]:
+        left = max(0, x1 - pad)
+        top = max(0, y1 - pad)
+        right = min(w, x2 + pad)
+        bottom = min(h, y2 + pad)
+        padded.append((left, top, right, bottom))
+
+    logger.info(f"[ADAPTIVE] Detected {len(padded)} text region(s)")
+    return padded
 
 
 def maybe_downscale(im: Image.Image) -> Tuple[Image.Image, bool]:
@@ -526,7 +668,9 @@ def call_vision_for_tiles(
 
     for attempt in range(1, MAX_RETRIES + 1):
         label = quadrant_label or "whole-page"
-        logger.info(f"Page {page_number} {label}: LLM attempt {attempt}/{MAX_RETRIES}")
+        logger.info(
+            f"Page {page_number} {label}: LLM attempt {attempt}/{MAX_RETRIES}"
+        )
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -556,7 +700,9 @@ def call_vision_for_tiles(
 
         except Exception as e:
             last_error = e
-            logger.warning(f"Page {page_number} {quadrant_label or 'whole'}: attempt {attempt} failed: {e}")
+            logger.warning(
+                f"Page {page_number} {quadrant_label or 'whole'}: attempt {attempt} failed: {e}"
+            )
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_SLEEP_SECONDS)
 
@@ -574,6 +720,7 @@ DATE_RE = re.compile(
     r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
     r"\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[,/]\s*\d{2,4})?\b"
 )
+
 YEAR_RE = re.compile(r"\b(17|18|19)\d{2}\b")
 
 
@@ -581,20 +728,43 @@ def normalize_whitespace(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).replace("\r", "")
 
 
+def clean_do_tokens(tokens: List[str]) -> List[str]:
+    """
+    Remove stray 'do' / 'Do' tokens that show up as OCR noise in names like
+    'Do Do Marshall', 'Do James Miller', etc.
+
+    We ONLY strip tokens that are exactly 'do' (case-insensitive) after
+    trimming basic punctuation. Real names like 'Doane' or 'Dorn' are untouched.
+    """
+    cleaned: List[str] = []
+    for tok in tokens:
+        t = tok.lower().strip(".,;:")
+        if t == "do":
+            continue
+        cleaned.append(tok)
+    return cleaned
+
+
 def sweep_places(text: str, initial_places: List[str]) -> List[Dict[str, Any]]:
+    """Detect places from hints + simple capitalized patterns."""
     found: Dict[str, str] = {}
+
     lowered = text.lower()
 
+    # 1) Dictionary-based matches
     for place in COMBINED_PLACES:
         if not place:
             continue
-        if place.lower() in lowered:
+        p_lower = place.lower()
+        if p_lower in lowered:
             found[place] = ""
 
+    # 2) Use any initial LLM places as seeds
     for p in initial_places:
         if p and p not in found:
             found[p] = ""
 
+    # 3) Very light heuristic: words ending in "Co.", "County", "Township"
     extra_places = re.findall(
         r"\b([A-Z][a-zA-Z]+(?:\s+(?:Co\.|County|Township|Borough|City)))\b", text
     )
@@ -653,27 +823,44 @@ def detect_military(joined: str) -> Tuple[bool, Optional[str]]:
 
 
 def sweep_people(text: str) -> List[Dict[str, Any]]:
+    """
+    Local people sweeper: uses honorifics + dictionary surnames + capitalized patterns.
+    Includes generic Mr., Mrs., Miss as honorifics.
+    Also strips stray 'do' / 'Do' tokens that are OCR junk.
+    """
     text = normalize_whitespace(text)
     people: Dict[str, Dict[str, Any]] = {}
 
+    # Pattern 1: Honorific + Name(s)
     honorific_pattern_union = "|".join(re.escape(h) for h in ALL_HONORIFICS)
     pattern = rf"\b(?:{honorific_pattern_union})\s+[A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+)*"
 
-    # Pattern 1: Honorific + Name(s)
     for m in re.finditer(pattern, text):
         full = m.group(0).strip()
         tokens = full.split()
+        tokens = clean_do_tokens(tokens)  # remove stray 'do' tokens
+        if not tokens:
+            continue
+
         honorific, role = detect_honorific_and_role(tokens)
         name_tokens = tokens[1:] if honorific else tokens
+        name_tokens = clean_do_tokens(name_tokens)  # just in case 'do' was in name portion too
+
+        if not name_tokens:
+            continue
+
         given = name_tokens[0] if name_tokens else None
         surname = name_tokens[-1] if len(name_tokens) > 1 else None
 
         joined = " ".join(tokens)
         is_military, rank = detect_military(joined)
 
-        if full not in people:
-            people[full] = {
-                "full_name": full,
+        cleaned_full = " ".join(tokens)
+        key = cleaned_full
+
+        if key not in people:
+            people[key] = {
+                "full_name": cleaned_full,
                 "given_name": given,
                 "surname": surname,
                 "church_role": role,
@@ -684,20 +871,26 @@ def sweep_people(text: str) -> List[Dict[str, Any]]:
                 "confidence": 0.85,
             }
 
-    # Pattern 2: Plain "Firstname Lastname" where Lastname is known surname
+    # Pattern 2: Plain "Firstname Lastname" where Lastname is in surnames list.
+    # We pre-filter 'do' tokens so they never make bogus names.
     surname_set = {s.lower() for s in COMBINED_SURNAMES}
-    tokens = text.split()
-    for i in range(len(tokens) - 1):
-        t1 = tokens[i]
-        t2 = tokens[i + 1]
+
+    raw_tokens = text.split()
+    filtered_tokens = [t for t in raw_tokens if t.lower().strip(".,;:") != "do"]
+
+    for i in range(len(filtered_tokens) - 1):
+        t1 = filtered_tokens[i]
+        t2 = filtered_tokens[i + 1]
         if not t1 or not t2:
             continue
         if not t1[0].isupper() or not t2[0].isupper():
             continue
+
         clean1 = re.sub(r"[^A-Za-z.'-]", "", t1)
         clean2 = re.sub(r"[^A-Za-z.'-]", "", t2)
         if not clean1 or not clean2:
             continue
+
         if clean2.lower().strip(".") in surname_set:
             full = f"{clean1} {clean2}"
             if full not in people:
@@ -717,8 +910,10 @@ def sweep_people(text: str) -> List[Dict[str, Any]]:
 
 
 def find_people_in_text(snippet: str, people: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach people to an event by simple substring / surname presence."""
     snippet_lower = snippet.lower()
     participants: List[Dict[str, Any]] = []
+
     for p in people:
         full = p.get("full_name") or ""
         surname = p.get("surname") or ""
@@ -728,6 +923,7 @@ def find_people_in_text(snippet: str, people: List[Dict[str, Any]]) -> List[Dict
         if surname and surname.lower() in snippet_lower:
             participants.append(p)
             continue
+
     unique: Dict[str, Dict[str, Any]] = {}
     for p in participants:
         key = p.get("full_name") or repr(p)
@@ -735,7 +931,12 @@ def find_people_in_text(snippet: str, people: List[Dict[str, Any]]) -> List[Dict
     return list(unique.values())
 
 
-def sweep_events(text: str, people: List[Dict[str, Any]], places: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def sweep_events(
+    text: str,
+    people: List[Dict[str, Any]],
+    places: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Detect simple birth/death/marriage/baptism/military-ish events from text."""
     events: List[Dict[str, Any]] = []
     sentences = split_sentences(text)
     place_names = [p["name"] for p in places]
@@ -790,13 +991,21 @@ def sweep_events(text: str, people: List[Dict[str, Any]], places: List[Dict[str,
 
 
 def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Attach places[], people[], events[] to LLM JSON.
+    Uses:
+    - sweep_places (with hints)
+    - sweep_people (honorifics + names, with 'do' cleanup)
+    - sweep_events (birth/death/marriage/baptism/military-ish)
+    """
     text = data.get("content") or data.get("raw_text") or ""
     text = text if isinstance(text, str) else str(text)
 
+    # Places: use any LLM places as seeds
     initial_places = data.get("places") or []
     if not isinstance(initial_places, list):
         initial_places = []
-    initial_places_str = []
+    initial_places_str: List[str] = []
     for p in initial_places:
         if isinstance(p, str):
             initial_places_str.append(p)
@@ -811,7 +1020,6 @@ def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
     data["people"] = people_struct
     data["events"] = events_struct
     return data
-
 
 # -------------------------
 # Output helpers
@@ -871,74 +1079,87 @@ def ocr_page(
 ) -> Dict[str, Any]:
     """
     For default layout: one call with tiled page (2x3).
-    For ledger/super_dense: 4 quadrant calls (2x2), then merge content.
+    For ledger/super_dense: adaptive text-region calls, then merge content.
     """
 
     w, h = im.size
     area = w * h
 
+    # Adaptive path for dense / ledger pages
     if layout_type in ("super_dense", "ledger"):
         logger.info(
-            f"Page {page}: QUADRANT mode (layout={layout_type}), size={w}x{h} ({area} px)"
+            f"Page {page}: ADAPTIVE-REGION mode (layout={layout_type}), size={w}x{h} ({area} px)"
         )
-        quadrants = tile_image(im, 2, 2)
-        model = HEAVY_MODEL  # heavy for dense
-        quadrant_results: List[Dict[str, Any]] = []
 
-        for idx, quad_img in enumerate(quadrants, start=1):
-            q_label = f"Q{idx}"
-            logger.info(f"Page {page}: processing quadrant {q_label}")
-            data_q = call_vision_for_tiles(
-                client=client,
-                page_number=page,
-                tiles=[quad_img],
-                layout_type=layout_type,
-                quadrant_label=q_label,
-                model=model,
+        regions = find_text_regions(im, max_regions=6, min_area_ratio=0.003, pad=20)
+
+        if regions:
+            model = HEAVY_MODEL  # heavy for dense
+            region_results: List[Dict[str, Any]] = []
+
+            for idx, box in enumerate(regions, start=1):
+                left, top, right, bottom = box
+                q_label = f"Q{idx}"
+                logger.info(
+                    f"Page {page}: processing region {q_label} box={box}"
+                )
+                region_img = im.crop(box)
+                data_q = call_vision_for_tiles(
+                    client=client,
+                    page_number=page,
+                    tiles=[region_img],
+                    layout_type=layout_type,
+                    quadrant_label=q_label,
+                    model=model,
+                )
+                region_results.append(data_q)
+
+            # Merge regions: use first region as base for metadata
+            base = region_results[0].copy()
+
+            merged_content_parts: List[str] = []
+            merged_raw_parts: List[str] = []
+
+            for q in region_results:
+                c = q.get("content") or ""
+                r = q.get("raw_text") or c
+                if c:
+                    merged_content_parts.append(c.strip())
+                if r:
+                    merged_raw_parts.append(r.strip())
+
+            full_content = "\n\n".join(merged_content_parts)
+            full_raw = "\n\n".join(merged_raw_parts)
+
+            base["content"] = full_content
+            base["raw_text"] = full_raw
+            base["quadrant_label"] = None  # final page is not a single region
+
+            # Reset places so local sweeper starts clean
+            base["places"] = []
+
+            return base
+        else:
+            logger.info(
+                f"Page {page}: no text regions detected; falling back to SINGLE-CALL tiling."
             )
-            quadrant_results.append(data_q)
 
-        # Merge quadrants: use first quadrant as base for metadata
-        base = quadrant_results[0].copy()
-
-        merged_content_parts: List[str] = []
-        merged_raw_parts: List[str] = []
-
-        for q in quadrant_results:
-            c = q.get("content") or ""
-            r = q.get("raw_text") or c
-            merged_content_parts.append(c.strip())
-            merged_raw_parts.append(r.strip())
-
-        full_content = "\n\n".join(part for part in merged_content_parts if part)
-        full_raw = "\n\n".join(part for part in merged_raw_parts if part)
-
-        base["content"] = full_content
-        base["raw_text"] = full_raw
-        base["quadrant_label"] = None  # final page is not a single quadrant
-
-        # Reset places so local sweeper starts clean
-        base["places"] = []
-
-        return base
-
-    else:
-        # Default single-call path with 2x3 tiling
-        rows, cols = LAYOUT_TILE_CONFIG["default"]
-        tiles = tile_image(im, rows, cols)
-        logger.info(
-            f"Page {page}: SINGLE-CALL mode layout={layout_type}, tiling={rows}x{cols}, size={w}x{h} ({area} px)"
-        )
-        model = HEAVY_MODEL if layout_type == "ledger" else BASELINE_MODEL
-        data = call_vision_for_tiles(
-            client=client,
-            page_number=page,
-            tiles=tiles,
-            layout_type=layout_type,
-            quadrant_label=None,
-            model=model,
-        )
-        return data
+    # Default single-call path with 2x3 tiling
+    rows, cols = LAYOUT_TILE_CONFIG["default"]
+    tiles = tile_image(im, rows, cols)
+    logger.info(
+        f"Page {page}: SINGLE-CALL mode layout={layout_type}, tiling={rows}x{cols}, size={w}x{h} ({area} px)"
+    )
+    model = HEAVY_MODEL if layout_type in ("ledger", "super_dense") else BASELINE_MODEL
+    data = call_vision_for_tiles(
+        client=client,
+        page_number=page,
+        tiles=tiles,
+        layout_type=layout_type,
+        quadrant_label=None,
+        model=model,
+    )
+    return data
 
 
 # -------------------------
