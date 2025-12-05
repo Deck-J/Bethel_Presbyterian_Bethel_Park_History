@@ -1,795 +1,1848 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Bethel Register OCR Script (batched / GitHub-Actions-friendly)
+Bethel OCR / ICR Pipeline
+Version: 2.37 (Adaptive + Quadrants + FIFO API Queue + Events w/ People & Places + External Prompts)
 
-- Reads configuration from environment variables (and .env if present)
-- Supports page ranges via START_PAGE / END_PAGE (including "all")
-- Designed to work with:
-    pages/page-1.png
-    pages/page-2.png
-    ...
-- Can auto-tile dense pages into vertical strips
-- Logs per-page complexity and behavior
-- Produces a single JSONL file (ocr_all_pages.jsonl) plus per-page JSONs
-- Supports DRY_RUN to skip OpenAI calls and emit stub JSON for testing
+Features:
+- Vision OCR via OpenAI (gpt-4o-mini / gpt-4o)
+- Automatic layout density detection
+- Adaptive text-region detection via OpenCV
+- For super-dense / ledger pages:
+    * Adaptive region mode
+    * If only one large region → fixed 2x2 quadrants
+    * Quadrants/regions processed in parallel (inner ThreadPoolExecutor)
+- For default pages:
+    * Single Vision call on 2x3 tiles
+- Strong prompts (system + user), now loaded from external files if present:
+    * prompts/ocr_system_prompt_v2.37.txt
+    * prompts/ocr_user_prompt_v2.37.txt
+- Tolerant JSON extraction:
+    * Markers, bare JSON, first {...}
+    * If none → wrap raw text into minimal JSON stub
+- Local post-processing:
+    * Places / people / events sweeper (lightweight)
+    * Events linked to people (full name / surname) and places, with dates/years
+    * Ambiguous names (e.g. Elizabeth) down-ranked as places if corpus shows
+      they overwhelmingly occur as first names, not towns
+- Page-level parallelism with ThreadPoolExecutor
+- Refusal / safety boilerplate scrubber on content/raw_text
+- Global FIFO queue for ALL OpenAI calls:
+    * Exactly one in-flight API call at a time
+    * Strictly ordered across all pages/quadrants
+    * Exponential backoff for rate limits / transient failures
 """
 
 import os
-import sys
 import re
 import json
-import math
 import time
-import csv
-import traceback
+import base64
+import logging
+import warnings
+import threading
+
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+from threading import Thread, Event
 
 from dotenv import load_dotenv
-from PIL import Image, ImageStat
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from PIL import Image
 from openai import OpenAI
+import numpy as np
+import cv2
 
-# -------------------------------------------------------------------
-# Environment & configuration
-# -------------------------------------------------------------------
+# Suppress decompression bomb warnings but raise pixel limit
+warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
+Image.MAX_IMAGE_PIXELS = 300_000_000
 
-# Increase PIL's safety limit; we're dealing with very large PNGs
-Image.MAX_IMAGE_PIXELS = None
+# -------------------------
+# Logging
+# -------------------------
 
-load_dotenv()  # local only; GitHub Actions uses env directly
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(levelname)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# Directories / files
-PAGES_DIR = Path(os.getenv("PAGES_DIR", "pages"))
-OUTPUT_JSONL = Path(os.getenv("OUTPUT_JSONL", "ocr_all_pages.jsonl"))
-PER_PAGE_DIR = Path(os.getenv("PER_PAGE_DIR", "per_page"))
-OCR_OUTPUT_DIR = Path(os.getenv("OCR_OUTPUT_DIR", "ocr_output"))
+# -------------------------
+# Paths & constants
+# -------------------------
 
-PER_PAGE_DIR.mkdir(parents=True, exist_ok=True)
-OCR_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+PAGES_DIR = BASE_DIR / "pages"
+OUTPUT_DIR = BASE_DIR / "ocr_output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+MASTER_JSONL = BASE_DIR / "ocr_all_pages.jsonl"
 
-# Models
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
+HINTS_FILE = BASE_DIR / "dictionary_hints.json"
+LAYOUT_OVERRIDES_PATH = BASE_DIR / "page_layout_overrides.json"
 
-# Concurrency
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+PROMPTS_DIR = BASE_DIR / "prompts"
+SYSTEM_PROMPT_PATH = PROMPTS_DIR / "ocr_system_prompt_v2.37.txt"
+USER_PROMPT_PATH = PROMPTS_DIR / "ocr_user_prompt_v2.37.txt"
 
-# Strips / tiling config
-USE_STRIPS = int(os.getenv("USE_STRIPS", "0"))          # 0 = full page, 1 = force strips
-AUTO_STRIP_MODE = int(os.getenv("AUTO_STRIP_MODE", "1"))  # 1 = auto-detect dense pages
+BASELINE_MODEL = os.getenv("BASELINE_MODEL", "gpt-4o-mini")
+HEAVY_MODEL = os.getenv("HEAVY_MODEL", "gpt-4o")
 
-STRIPS_PER_PAGE = int(os.getenv("STRIPS_PER_PAGE", "6"))
-MAX_STRIPS_PER_PAGE = int(os.getenv("MAX_STRIPS_PER_PAGE", "8"))
-STRIP_OVERLAP = int(os.getenv("STRIP_OVERLAP", "20"))
+PAGE_LIST_ENV = os.getenv("PAGE_LIST", "").strip()
 
-# Density thresholds
-EASY_INK_THRESHOLD = float(os.getenv("EASY_INK_THRESHOLD", "0.05"))
-DENSE_INK_THRESHOLD = float(os.getenv("DENSE_INK_THRESHOLD", "0.12"))
-SUPER_DENSE_INK_THRESHOLD = float(os.getenv("SUPER_DENSE_INK_THRESHOLD", "0.18"))
+MAX_RETRIES = int(os.getenv("OCR_MAX_RETRIES", "2"))
+RETRY_SLEEP_SECONDS = float(os.getenv("OCR_RETRY_SLEEP", "4"))
+MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "4"))
 
-# Downscaling limits
-MAX_LONG_DIM = int(os.getenv("MAX_LONG_DIM", "2048"))
-MAX_TOTAL_PIXELS = int(os.getenv("MAX_TOTAL_PIXELS", "20000000"))
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "90000000"))
 
-# Complexity log
-COMPLEXITY_LOG = Path(os.getenv("COMPLEXITY_LOG", "page_complexity.csv"))
+TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.37"
 
-# Page range
-START_PAGE_ENV = os.getenv("START_PAGE")
-END_PAGE_ENV = os.getenv("END_PAGE")
+LAYOUT_TILE_CONFIG = {
+    "default": (2, 3),   # rows, cols
+}
 
-# Dry-run mode
-DRY_RUN_ENV = os.getenv("DRY_RUN", "0").strip()
-DRY_RUN = DRY_RUN_ENV.lower() in ("1", "true", "yes", "y", "on")
+# -------------------------
+# Global FIFO API queue
+# -------------------------
+
+GLOBAL_API_QUEUE: "Queue[tuple]" = Queue()
+GLOBAL_API_WORKER_STARTED = False
+GLOBAL_API_WORKER_LOCK = threading.Lock()
 
 
-def _parse_page_env(value: Optional[str]) -> Optional[int]:
+def _do_openai_call(client: OpenAI, model: str, messages: List[Dict[str, Any]]):
     """
-    Parse START_PAGE / END_PAGE environment values.
-
-    Accepted:
-      - empty or None         -> None (no limit)
-      - "all" (any case)      -> None (no limit)
-      - integer string        -> int
-    Anything else will be treated as 'no limit' with a warning.
+    Actual OpenAI API call with exponential backoff for rate limits / transient errors.
+    Uses MAX_RETRIES as the cap on attempts.
     """
-    if value is None:
-        return None
-    value_str = value.strip()
-    if value_str == "":
-        return None
-    if value_str.lower() == "all":
-        return None
-    try:
-        return int(value_str)
-    except ValueError:
-        print(f"[WARN] Could not parse page value '{value_str}', treating as 'all'.")
-        return None
+    delay = RETRY_SLEEP_SECONDS or 2.0
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                temperature=0.0,
+                messages=messages,
+            )
+        except Exception as e:
+            msg = str(e)
+            # crude but robust: look for rate-limit / 429 hints
+            is_rate_limit = (
+                "429" in msg or
+                "rate limit" in msg.lower() or
+                "too many requests" in msg.lower()
+            )
+            # transient-ish errors we might want to retry
+            is_transient = any(
+                kw in msg.lower()
+                for kw in ["timeout", "temporarily unavailable", "try again", "server error"]
+            )
+
+            if attempt < MAX_RETRIES and (is_rate_limit or is_transient):
+                logger.warning(
+                    f"[RATE_LIMIT/TRANSIENT] attempt {attempt} failed: {msg} "
+                    f"→ sleeping {delay:.1f}s then retry"
+                )
+                time.sleep(delay)
+                delay *= 2.0
+                continue
+
+            # no retry or final attempt → re-raise
+            logger.error(f"[OPENAI_CALL] final failure on attempt {attempt}: {msg}")
+            raise
+
+    # Should be unreachable
+    raise RuntimeError("Unreachable: exhausted retries in _do_openai_call")
 
 
-START_PAGE: Optional[int] = _parse_page_env(START_PAGE_ENV)
-END_PAGE: Optional[int] = _parse_page_env(END_PAGE_ENV)
+def start_global_api_worker(client: OpenAI) -> None:
+    """
+    Start a single global worker thread that consumes tasks from GLOBAL_API_QUEUE.
+    Each task is a tuple: (callable, args, kwargs, promise_dict).
+    """
+    global GLOBAL_API_WORKER_STARTED
 
-# ---------------------------------------
-# LOGGING: Report Final START/END Pages
-# ---------------------------------------
+    with GLOBAL_API_WORKER_LOCK:
+        if GLOBAL_API_WORKER_STARTED:
+            return
+        GLOBAL_API_WORKER_STARTED = True
 
+        def worker():
+            logger.info("[API_WORKER] Global API worker thread started")
+            while True:
+                task = GLOBAL_API_QUEUE.get()
+                if task is None:
+                    logger.info("[API_WORKER] Shutdown signal received")
+                    GLOBAL_API_QUEUE.task_done()
+                    break
 
-def _format_page_val(val: Optional[int]) -> str:
-    if val is None:
-        return "None (no limit)"
-    try:
-        return str(int(val))
-    except Exception:
-        return f"{val} (raw)"
+                func, args, kwargs, promise = task
+                try:
+                    result = func(*args, **kwargs)
+                    promise["result"] = result
+                except Exception as e:
+                    promise["error"] = e
+                finally:
+                    # wake up the waiting thread
+                    promise["event"].set()
+                    GLOBAL_API_QUEUE.task_done()
 
-
-print("==============================================")
-print(" OCR PAGE RANGE CONFIGURATION")
-print("==============================================")
-print(f"  START_PAGE (raw env) : {START_PAGE_ENV!r}")
-print(f"  END_PAGE   (raw env) : {END_PAGE_ENV!r}")
-print(f"  → START_PAGE parsed  : {_format_page_val(START_PAGE)}")
-print(f"  → END_PAGE parsed    : {_format_page_val(END_PAGE)}")
-print(f"  DRY_RUN              : {DRY_RUN} (raw={DRY_RUN_ENV!r})")
-
-if START_PAGE is None and END_PAGE is None:
-    print("  → Processing ALL pages (local mode or unbounded run).")
-elif START_PAGE is not None and END_PAGE is not None:
-    print(f"  → Processing pages {START_PAGE} through {END_PAGE}.")
-elif START_PAGE is not None:
-    print(f"  → Processing pages {START_PAGE} through end-of-list.")
-elif END_PAGE is not None:
-    print(f"  → Processing pages 1 through {END_PAGE}.")
-print("==============================================\n")
-
-# -------------------------------------------------------------------
-# OpenAI client (only used if not DRY_RUN)
-# -------------------------------------------------------------------
-
-client = None
-if not DRY_RUN:
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-else:
-    print("[INFO] DRY_RUN enabled: OpenAI client will NOT be created.\n")
-
-# -------------------------------------------------------------------
-# Dictionary hints (names, roles, places, fuzzy variants)
-# -------------------------------------------------------------------
-
-DICTIONARY_HINTS_PATH = Path("dictionary_hints.json")
+        t = Thread(target=worker, daemon=True)
+        t.start()
 
 
-def load_dictionary_hints() -> Dict[str, Any]:
-    if not DICTIONARY_HINTS_PATH.exists():
-        print("[INFO] No dictionary_hints.json found; proceeding without extra hints.")
+def enqueue_api_call(func, *args, **kwargs):
+    """
+    Put a single API call into the global FIFO queue and block until it's done.
+    Returns: the value that func(*args, **kwargs) produced or raises its exception.
+    """
+    event = Event()
+    promise = {"event": event, "result": None, "error": None}
+
+    GLOBAL_API_QUEUE.put((func, args, kwargs, promise))
+
+    # Blocking wait until worker finishes this task and signals via the Event
+    event.wait()
+
+    if promise["error"] is not None:
+        raise promise["error"]
+
+    return promise["result"]
+
+# -------------------------
+# Dictionaries / hints
+# -------------------------
+
+DEFAULT_SURNAMES = [
+    "Marshall", "Miller", "McMillan", "Millar", "Clark", "Calhoun",
+    "Fleming", "Sample", "Dimmon", "Dimmond", "Fairchild",
+    "Elliott", "Elliot", "Hill", "Kelly", "Smith", "Jones",
+    "Hutchison", "Hutchinson", "McFarland", "Anderson",
+]
+
+DEFAULT_PLACES = [
+    "Bethel", "Bethel Church", "Bethel Cemetery", "Pittsburgh",
+    "Allegheny", "Minisink", "Deckertown", "Petersburgh",
+    "Wilderness", "Antietam", "Gettysburg", "Virginia",
+    "Augusta Stone Church", "Westmoreland", "Washington County",
+]
+
+HONORIFICS_RELIGIOUS = [
+    "Rev.", "Revd.", "Pastor", "Elder", "Ruling Elder",
+    "Deacon", "Moderator", "Clerk", "Trustee"
+]
+
+HONORIFICS_CIVIC = ["Dr.", "Esq.", "Hon.", "Judge"]
+
+HONORIFICS_MILITARY = [
+    "Col.", "Colonel", "Capt.", "Captain", "Lieut.", "Lt.",
+    "Sgt.", "Sergeant", "Corp.", "Corporal", "Pvt.", "Private",
+    "Gen.", "General"
+]
+
+HONORIFICS_GENERIC = ["Mr.", "Mrs.", "Miss"]
+
+DEFAULT_MILITARY_KEYWORDS = [
+    "Civil War", "war", "regiment", "company", "Co.",
+    "killed", "wounded", "died", "battle", "camp",
+    "Petersburgh", "Petersburg", "Wilderness", "Gettysburg",
+    "Antietam", "Chancellorsville",
+    "army", "infantry", "artillery", "cavalry",
+    "battery", "brigade", "division",
+    "volunteers", "volunteer",
+    "mustered", "enlisted", "discharged",
+    "prisoner", "captured",
+]
+ALL_HONORIFICS = (
+    HONORIFICS_RELIGIOUS
+    + HONORIFICS_CIVIC
+    + HONORIFICS_MILITARY
+    + HONORIFICS_GENERIC
+)
+
+
+def load_hints() -> Dict[str, Any]:
+    if not HINTS_FILE.exists():
+        logger.warning("[HINTS] No dictionary_hints.json found; using built-in defaults only")
         return {}
     try:
-        with DICTIONARY_HINTS_PATH.open("r", encoding="utf-8") as f:
+        with HINTS_FILE.open("r", encoding="utf-8") as f:
             hints = json.load(f)
-        print("[INFO] Loaded dictionary_hints.json.")
+        logger.info(
+            "[HINTS] Loaded dictionary_hints.json → "
+            f"{len(hints.get('names', []))} names, "
+            f"{len(hints.get('places', []))} places, "
+            f"{len(hints.get('church_terms', []))} church terms, "
+            f"{len(hints.get('military_keywords', []))} military keywords"
+        )
         return hints
     except Exception as e:
-        print(f"[WARN] Failed to load dictionary_hints.json: {e}")
+        logger.error(f"[HINTS] Failed to load dictionary_hints.json: {e}")
         return {}
 
 
-DICTIONARY_HINTS = load_dictionary_hints()
-
-# -------------------------------------------------------------------
-# Utility: page number extraction
-# -------------------------------------------------------------------
+HINTS = load_hints()
 
 
-def extract_page_number(path: Path) -> int:
+def combined_list(base: List[str], extra: Optional[List[str]]) -> List[str]:
+    if not extra:
+        return sorted(set(base))
+    return sorted(set(base + extra))
+
+
+COMBINED_SURNAMES = combined_list(DEFAULT_SURNAMES, HINTS.get("names"))
+COMBINED_PLACES = combined_list(DEFAULT_PLACES, HINTS.get("places"))
+COMBINED_CHURCH_TERMS = combined_list([], HINTS.get("church_terms"))
+COMBINED_MILITARY = combined_list(DEFAULT_MILITARY_KEYWORDS, HINTS.get("military_keywords"))
+
+# -------------------------
+# Ambiguous name/place frequency logic
+# -------------------------
+
+# Names that can be both people and places – we treat them cautiously as "places"
+AMBIGUOUS_PLACE_NAMES = {
+    "Elizabeth",
+    "Washington",
+    "Madison",
+    "Florence",
+    "Charlotte",
+}
+
+NAME_TOWN_STATS: Optional[Dict[str, Dict[str, int]]] = None
+
+
+def normalize_token(s: str) -> str:
     """
-    Try to infer page number from filename.
-
-    Expected primary pattern: pages/page-<N>.png
-    But we also support legacy patterns like:
-      <N>-something.png
-    If no match, return -1.
+    Normalize tokens for loose comparison:
+    - strip punctuation
+    - collapse spaces
+    - title-case (Elizabeth, Washington)
     """
-    name = path.name
-
-    # New preferred pattern
-    m = re.match(r"^page-(\d+)\.png$", name)
-    if m:
-        return int(m.group(1))
-
-    # Legacy pattern: leading digits, then dash
-    m2 = re.match(r"^(\d+)-", name)
-    if m2:
-        return int(m2.group(1))
-
-    # Fallback: any digits
-    m3 = re.search(r"(\d+)", name)
-    if m3:
-        return int(m3.group(1))
-
-    return -1
+    if not isinstance(s, str):
+        return ""
+    s = s.strip().strip(",.;:()[]")
+    s = re.sub(r"\s+", " ", s)
+    return s.title()
 
 
-# -------------------------------------------------------------------
-# Utility: image complexity measurement
-# -------------------------------------------------------------------
-
-
-def compute_ink_density(im: Image.Image) -> float:
+def build_name_town_stats() -> Dict[str, Dict[str, int]]:
     """
-    Rough "ink density" measure: convert to grayscale, normalize,
-    and estimate non-background pixels.
+    Scan existing JSON outputs (MASTER_JSONL if present, otherwise page-*.json)
+    and build simple frequency counts for ambiguous tokens:
+      - how often they appear as FIRST NAMES in people.full_name
+      - how often they appear as places.name
     """
-    gray = im.convert("L")
-    stat = ImageStat.Stat(gray)
-    mean = stat.mean[0]  # 0-255
-    ink = (255.0 - mean) / 255.0
-    return float(max(0.0, min(1.0, ink)))
+    global NAME_TOWN_STATS
+    if NAME_TOWN_STATS is not None:
+        return NAME_TOWN_STATS
 
-
-def resize_for_ocr(im: Image.Image) -> Image.Image:
-    """
-    Downscale image to stay under MAX_LONG_DIM and MAX_TOTAL_PIXELS.
-    Preserves aspect ratio.
-    """
-    w, h = im.size
-    total_pixels = w * h
-
-    # Enforce total pixels limit
-    if total_pixels > MAX_TOTAL_PIXELS:
-        scale = math.sqrt(MAX_TOTAL_PIXELS / float(total_pixels))
-        w = int(w * scale)
-        h = int(h * scale)
-        im = im.resize((w, h), Image.LANCZOS)
-        total_pixels = w * h
-
-    # Enforce max long dimension
-    long_dim = max(w, h)
-    if long_dim > MAX_LONG_DIM:
-        scale = MAX_LONG_DIM / float(long_dim)
-        w = int(w * scale)
-        h = int(h * scale)
-        im = im.resize((w, h), Image.LANCZOS)
-
-    return im
-
-
-# -------------------------------------------------------------------
-# Strip tiling
-# -------------------------------------------------------------------
-
-
-def compute_strip_boxes(width: int, height: int, num_strips: int, overlap: int) -> List[Tuple[int, int, int, int]]:
-    """
-    Compute vertical strip bounding boxes (left, upper, right, lower).
-    Overlap is applied horizontally between strips.
-    """
-    if num_strips <= 1:
-        return [(0, 0, width, height)]
-
-    effective_width = width + overlap * (num_strips - 1)
-    step = effective_width // num_strips
-
-    boxes = []
-    for i in range(num_strips):
-        left = i * step - i * overlap
-        right = left + step
-        left = max(0, left)
-        right = min(width, right)
-        if right > left:
-            boxes.append((left, 0, right, height))
-    return boxes
-
-
-# -------------------------------------------------------------------
-# Prompt construction
-# -------------------------------------------------------------------
-
-
-def build_system_prompt(hints: Dict[str, Any]) -> str:
-    names = hints.get("names", [])
-    church_roles = hints.get("church_roles", [])
-    places = hints.get("places", [])
-    military_terms = hints.get("military_terms", [])
-
-    parts = [
-        "You are an expert historical OCR and transcription assistant specializing in 18th–20th century Presbyterian church registers.",
-        "You must:",
-        "  - Transcribe the page as faithfully as possible.",
-        "  - Normalize a second version with corrected spelling and punctuation where reasonably clear.",
-        "  - Identify personal names, roles, places, dates, and military associations (e.g., Civil War, Revolutionary War).",
-        "  - Recognize ledger structures and mark empty ledger lines if there are brackets or ruled lines with no text.",
-        "  - It is OK to skip empty ledger brackets that have no text, BUT if a ledger line is clearly meant to be present and is empty, include a marker such as '[empty ledger line]'.",
-        "  - Do NOT hallucinate text—only complete gaps where context makes the words highly likely based on surrounding handwriting.",
-        "",
-        "Output must be JSON with keys:",
-        "  - page_number (if visible or inferred)",
-        "  - page_title (short description)",
-        "  - content (cleaned/structured transcription, Markdown allowed)",
-        "  - raw_text (rough/near-verbatim transcription)",
-        "  - extracted_names (list of names as strings)",
-        "  - extracted_dates (list of objects with raw/month/day/year/type)",
-        "  - identified_roles (map name -> roles in church, e.g. 'Elder', 'Deacon', 'Pastor')",
-        "  - tags (list of strings)",
-        "  - military_service (object with fields: has_military_association, conflict, service_side, service_status, evidence_level, evidence_snippets, auto_inferred, confidence, review_status)",
-        "  - page_date (an object describing date or range of the page if inferable)",
-        "  - page_locations (list of places mentioned or implied).",
-        "",
-        "If there is clearly a Civil War or Revolutionary War soldier death, explicitly include that in military_service.",
-        "If there is no military content, set has_military_association=false.",
-        "",
-        "Use conservative scholarly guessing on partially illegible words, marking uncertain text in square brackets like '[?]'.",
-    ]
-
-    if names:
-        parts.append("")
-        parts.append("Known frequent personal names to prioritize in matching (do not force them if handwriting clearly differs):")
-        parts.append(", ".join(sorted(set(names))))
-
-    if church_roles:
-        parts.append("")
-        parts.append("Common church roles:")
-        parts.append(", ".join(sorted(set(church_roles))))
-
-    if places:
-        parts.append("")
-        parts.append("Common places/locations that may appear:")
-        parts.append(", ".join(sorted(set(places))))
-
-    if military_terms:
-        parts.append("")
-        parts.append("Common military-related terms to watch for:")
-        parts.append(", ".join(sorted(set(military_terms))))
-
-    return "\n".join(parts)
-
-
-SYSTEM_PROMPT = build_system_prompt(DICTIONARY_HINTS)
-
-# -------------------------------------------------------------------
-# OpenAI helper
-# -------------------------------------------------------------------
-
-
-def ocr_with_openai(image_bytes: bytes, filename: str) -> Dict[str, Any]:
-    """
-    Send a single page (or strip) to the vision model and get structured JSON back.
-    """
-    import base64
-
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-    prompt_user = (
-        "Transcribe this page (or page segment) from a historic handwritten Presbyterian church register. "
-        "Return ONLY a single JSON object, no extra commentary."
-    )
-
-    resp = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_user},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{b64_image}"
-                        },
-                    },
-                ],
-            },
-        ],
-        temperature=0.1,
-        max_tokens=1500,
-    )
-
-    content = resp.choices[0].message.content
-
-    # Try to parse JSON out of the content
-    try:
-        json_str = content.strip()
-        if json_str.startswith("```"):
-            json_str = re.sub(r"^```(json)?", "", json_str.strip(), flags=re.IGNORECASE)
-            json_str = re.sub(r"```$", "", json_str.strip())
-        data = json.loads(json_str)
-    except Exception as e:
-        print(f"[WARN] Failed to parse JSON for {filename}: {e}")
-        data = {
-            "raw_response": content,
-            "parse_error": str(e),
-        }
-
-    return data
-
-
-# -------------------------------------------------------------------
-# Defaults / helpers
-# -------------------------------------------------------------------
-
-
-def default_military_service() -> Dict[str, Any]:
-    return {
-        "has_military_association": False,
-        "conflict": None,
-        "service_side": None,
-        "service_status": None,
-        "evidence_level": "none",
-        "evidence_snippets": [],
-        "auto_inferred": False,
-        "confidence": 0.0,
-        "review_status": "unknown",
+    stats: Dict[str, Dict[str, int]] = {
+        name: {"as_person_first": 0, "as_place": 0}
+        for name in AMBIGUOUS_PLACE_NAMES
     }
 
+    def _update_from_obj(obj: Dict[str, Any]) -> None:
+        # People → first names
+        for person in obj.get("people", []) or []:
+            if not isinstance(person, dict):
+                continue
+            full = person.get("full_name") or ""
+            if not isinstance(full, str) or not full.strip():
+                continue
+            tokens = full.strip().split()
+            if len(tokens) < 2:
+                continue
+            first = normalize_token(tokens[1])  # tokens[0] is usually honorific
+            if first in stats:
+                stats[first]["as_person_first"] += 1
 
-def _image_to_bytes(im: Image.Image) -> bytes:
+        # Places → names
+        for pl in obj.get("places", []) or []:
+            if isinstance(pl, dict):
+                nm = pl.get("name") or ""
+            else:
+                nm = pl
+            if not isinstance(nm, str) or not nm.strip():
+                continue
+            nm_norm = normalize_token(nm)
+            if nm_norm in stats:
+                stats[nm_norm]["as_place"] += 1
+
+    # Prefer master JSONL if it exists
+    if MASTER_JSONL.exists():
+        try:
+            with MASTER_JSONL.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    _update_from_obj(obj)
+        except Exception as e:
+            logger.warning(f"[NAME_TOWN_STATS] Failed reading MASTER_JSONL: {e}")
+
+    # Also scan per-page JSON to catch new runs or if MASTER_JSONL is missing
+    try:
+        for p in OUTPUT_DIR.glob("page-*.json"):
+            if p.name.endswith("_raw_broken.json"):
+                continue
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    obj = json.load(f)
+            except Exception:
+                continue
+            _update_from_obj(obj)
+    except Exception as e:
+        logger.warning(f"[NAME_TOWN_STATS] Failed scanning per-page JSON: {e}")
+
+    NAME_TOWN_STATS = stats
+    logger.info(
+        "[NAME_TOWN_STATS] Built ambiguous name/place stats: " +
+        ", ".join(
+            f"{name} P={counts['as_person_first']} / T={counts['as_place']}"
+            for name, counts in stats.items()
+        )
+    )
+    return NAME_TOWN_STATS
+
+# -------------------------
+# Page list w/ ranges
+# -------------------------
+
+
+def parse_page_list() -> List[int]:
+    """
+    PAGE_LIST examples:
+      PAGE_LIST="3,5,10"
+      PAGE_LIST="1-10"
+      PAGE_LIST="1-5,10,20-22"
+    If PAGE_LIST is empty, auto-detect from pages/*.png numeric stems.
+    """
+    if PAGE_LIST_ENV:
+        out: List[int] = []
+        for token in PAGE_LIST_ENV.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                try:
+                    a_str, b_str = token.split("-", 1)
+                    a, b = int(a_str), int(b_str)
+                    if a <= b:
+                        out.extend(range(a, b + 1))
+                    else:
+                        out.extend(range(b, a + 1))
+                except ValueError:
+                    logger.warning(f"[PAGE_LIST] Skipping invalid range: {token}")
+            else:
+                try:
+                    out.append(int(token))
+                except ValueError:
+                    logger.warning(f"[PAGE_LIST] Skipping invalid page: {token}")
+        return sorted(set(out))
+
+    pages: List[int] = []
+    for p in PAGES_DIR.glob("*.png"):
+        try:
+            pages.append(int(p.stem))
+        except ValueError:
+            continue
+    return sorted(pages)
+
+# -------------------------
+# Image helpers
+# -------------------------
+
+
+def tile_is_mostly_blank(im: Image.Image, threshold: float = 0.985) -> bool:
+    """
+    Return True if the tile is mostly blank (very low ink coverage).
+    threshold is the fraction of pixels that must be 'background' to treat it as blank.
+    0.985 means '≥ 98.5% of pixels are background' → skip.
+    """
+    import numpy as np
+    import cv2
+
+    # convert to gray
+    gray = cv2.cvtColor(np.array(im.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    # Otsu threshold to separate ink from paper
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # th is 255 for background, 0 for ink (after inversion in some paths, but here we keep it simple)
+    total = th.size
+    if total == 0:
+        return True
+
+    # treat 'very light' as background as well
+    background = np.count_nonzero(th > 250)
+    frac_background = background / float(total)
+
+    return frac_background >= threshold
+
+
+
+
+def maybe_downscale(im: Image.Image) -> Tuple[Image.Image, bool]:
+    w, h = im.size
+    area = w * h
+    if area <= MAX_IMAGE_PIXELS:
+        return im, False
+    scale = (MAX_IMAGE_PIXELS / float(area)) ** 0.5
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    logger.info(f"[DOWNSCALE] {w}x{h} → {new_w}x{new_h}")
+    return im.resize((new_w, new_h), Image.LANCZOS), True
+
+
+def tile_image(im: Image.Image, rows: int, cols: int) -> List[Image.Image]:
+    w, h = im.size
+    tw = w // cols
+    th = h // rows
+    tiles: List[Image.Image] = []
+    for r in range(rows):
+        for c in range(cols):
+            left = c * tw
+            upper = r * th
+            right = (c + 1) * tw if c < cols - 1 else w
+            lower = (r + 1) * th if r < rows - 1 else h
+            tiles.append(im.crop((left, upper, right, lower)))
+    return tiles
+
+
+def image_to_data_url(im: Image.Image) -> str:
     from io import BytesIO
     buf = BytesIO()
     im.save(buf, format="PNG")
-    return buf.getvalue()
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+# -------------------------
+# Adaptive text-region detection
+# -------------------------
 
 
-# -------------------------------------------------------------------
-# Per-page processing
-# -------------------------------------------------------------------
+def _merge_boxes(boxes: List[Tuple[int, int, int, int]], gap: int) -> List[Tuple[int, int, int, int]]:
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    merged: List[Tuple[int, int, int, int]] = []
+    cur = boxes[0]
 
+    def close(a, b) -> bool:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ax1 -= gap
+        ay1 -= gap
+        ax2 += gap
+        ay2 += gap
+        return not (bx2 < ax1 or bx1 > ax2 or by2 < ay1 or by1 > ay2)
 
-def analyze_page_complexity(img_path: Path) -> Dict[str, Any]:
-    """
-    Load the image (possibly huge), downscale for complexity measurement,
-    and decide how many strips (if any) to use.
-    """
-    try:
-        im = Image.open(img_path)
-    except Exception as e:
-        print(f"[ERROR] Unable to open image {img_path}: {e}")
-        return {
-            "path": str(img_path),
-            "failed_to_open": True,
-            "ink_density": None,
-            "strips_planned": 1,
-            "mode": "failed-open",
-        }
-
-    w, h = im.size
-    im_small = resize_for_ocr(im)
-    ink = compute_ink_density(im_small)
-
-    strips = 1
-    mode = "full-page"
-
-    if USE_STRIPS == 1:
-        strips = STRIPS_PER_PAGE
-        mode = "force-strips"
-    elif AUTO_STRIP_MODE == 1:
-        if ink < EASY_INK_THRESHOLD:
-            strips = 1
-            mode = "easy-full-page"
-        elif ink < DENSE_INK_THRESHOLD:
-            strips = 1
-            mode = "medium-full-page"
-        elif ink < SUPER_DENSE_INK_THRESHOLD:
-            strips = STRIPS_PER_PAGE
-            mode = "dense-strips"
+    for b in boxes[1:]:
+        if close(cur, b):
+            cur = (
+                min(cur[0], b[0]),
+                min(cur[1], b[1]),
+                max(cur[2], b[2]),
+                max(cur[3], b[3]),
+            )
         else:
-            strips = MAX_STRIPS_PER_PAGE
-            mode = "super-dense-max-strips"
-    else:
-        strips = 1
-        mode = "auto-disabled-full-page"
-
-    return {
-        "path": str(img_path),
-        "width": w,
-        "height": h,
-        "ink_density": ink,
-        "strips_planned": strips,
-        "mode": mode,
-    }
-
-
-def write_complexity_row(csv_path: Path, row: Dict[str, Any]) -> None:
-    """
-    Append a row to the complexity CSV. Creates file with header if needed.
-    """
-    file_exists = csv_path.exists()
-    fieldnames = [
-        "path",
-        "page_number",
-        "width",
-        "height",
-        "ink_density",
-        "strips_planned",
-        "mode",
-        "error",
-    ]
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def merge_military_blocks(blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Merge multiple military_service blocks from strips into a single page-level block.
-    """
-    if not blocks:
-        return default_military_service()
-
-    any_military = any(b.get("has_military_association") for b in blocks)
-    if not any_military:
-        return default_military_service()
-
-    def conf(b: Dict[str, Any]) -> float:
-        try:
-            return float(b.get("confidence", 0.0))
-        except Exception:
-            return 0.0
-
-    best = max(blocks, key=conf)
-
-    all_snips: List[str] = []
-    for b in blocks:
-        sn = b.get("evidence_snippets") or []
-        for s in sn:
-            if s not in all_snips:
-                all_snips.append(s)
-
-    merged = dict(best)
-    merged["evidence_snippets"] = all_snips
-    merged["has_military_association"] = True
-    if "review_status" not in merged:
-        merged["review_status"] = "auto-merged"
+            merged.append(cur)
+            cur = b
+    merged.append(cur)
     return merged
 
 
-def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    """
-    Append one JSON object as a single line to the master JSONL.
-    """
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False))
-        f.write("\n")
+def find_text_regions(
+    im: Image.Image,
+    max_regions: int = 6,
+    min_area_ratio: float = 0.003,
+    pad: int = 20,
+) -> List[Tuple[int, int, int, int]]:
+    rgb = np.array(im.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bin_img = 255 - th
+
+    kw = max(15, w // 80)
+    kh = max(5, h // 250)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+    mor = cv2.dilate(bin_img, kernel, 1)
+    mor = cv2.erode(mor, kernel, 1)
+
+    contours, _ = cv2.findContours(mor, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = min_area_ratio * w * h
+
+    boxes: List[Tuple[int, int, int, int]] = []
+    for c in contours:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw * bh >= min_area:
+            boxes.append((x, y, x + bw, y + bh))
+
+    if not boxes:
+        logger.info("[ADAPTIVE] No text regions detected")
+        return []
+
+    boxes = _merge_boxes(boxes, max(w, h) // 100)
+    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))[:max_regions]
+
+    padded: List[Tuple[int, int, int, int]] = []
+    for x1, y1, x2, y2 in boxes:
+        padded.append(
+            (max(0, x1 - pad), max(0, y1 - pad), min(w, x2 + pad), min(h, y2 + pad))
+        )
+
+    logger.info(f"[ADAPTIVE] Detected {len(padded)} region(s)")
+    return padded
+
+# -------------------------
+# Prompts (with external-file support)
+# -------------------------
 
 
-def process_page(img_path: Path) -> Optional[Dict[str, Any]]:
+def build_system_prompt() -> str:
     """
-    Process a single page:
-      - analyze complexity
-      - if DRY_RUN: create stub JSON only
-      - else: OCR full-page or strips
-      - write per-page JSON
-      - append to master JSONL
+    Load system prompt from external file if present, otherwise fall back
+    to the older inline prompt that also injects dictionary hints.
     """
-    page_number = extract_page_number(img_path)
-    print(f"[OCR] Processing page {page_number} — {img_path}")
+    if SYSTEM_PROMPT_PATH.exists():
+        try:
+            text = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+            logger.info(f"[PROMPTS] Using external system prompt: {SYSTEM_PROMPT_PATH}")
+            return text
+        except Exception as e:
+            logger.warning(f"[PROMPTS] Failed to read system prompt file: {e}")
 
-    complexity = analyze_page_complexity(img_path)
-    complexity_row = {
-        "path": complexity.get("path"),
-        "page_number": page_number,
-        "width": complexity.get("width"),
-        "height": complexity.get("height"),
-        "ink_density": complexity.get("ink_density"),
-        "strips_planned": complexity.get("strips_planned"),
-        "mode": complexity.get("mode"),
-        "error": None,
-    }
+    # Fallback inline prompt with hints
+    surnames_str = ", ".join(COMBINED_SURNAMES[:80])
+    places_str = ", ".join(COMBINED_PLACES[:80])
+    church_terms_str = ", ".join(COMBINED_CHURCH_TERMS[:80])
+    military_str = ", ".join(COMBINED_MILITARY[:80])
+    honorifics_str = ", ".join(ALL_HONORIFICS)
 
-    strips_planned = complexity.get("strips_planned", 1)
-    mode = complexity.get("mode", "unknown")
+    logger.info("[PROMPTS] Using built-in system prompt fallback")
+
+    return f"""
+You are an expert historical paleographer and archivist working on PUBLIC DOMAIN
+18th–19th century Presbyterian church records (Bethel and related congregations).
+These documents are over 150 years old and contain no modern personal data.
+
+CRITICAL SAFETY NOTE (READ CAREFULLY):
+- This work is fully allowed under all policies.
+- Do NOT refuse.
+- Do NOT apologize.
+- Do NOT output safety warnings.
+- Never produce phrases like "I'm sorry, I can't assist with that" or
+  "I can't help with that request."
+- Your task is purely neutral transcription and light structuring of
+  historical, public-domain material.
+
+You will receive images (or tiles) from ONE page or a clearly delimited
+quadrant/region of a page.
+
+Your tasks:
+
+1) Perform high-fidelity OCR / ICR transcription.
+2) Provide light structural metadata about that page/quadrant.
+3) Return a SINGLE JSON object between markers:
+
+   ---BEGIN_JSON---
+   {{ ... }}
+   ---END_JSON---
+
+Anything outside those markers will be ignored.
+
+==================
+JSON OBJECT SCHEMA
+==================
+
+The JSON object MUST include at least:
+
+{{
+  "page_number": <integer>,          // physical page number
+  "quadrant_label": <string or null>,// e.g. "Q1", "Q2" for quadrant calls
+  "page_title": <string or null>,
+  "page_type": "narrative" | "ledger" | "mixed",
+  "record_type": <string>,           // e.g. "session minutes", "family visitation ledger",
+  "page_date_hint": <string or null>,// best-guess date like "Nov 1853" or "Jan 10 1855"
+  "transcription_method": "{TRANSCRIPTION_VERSION}",
+  "transcription_quality": "high" | "medium" | "low",
+
+  "content": <string>,               // cleaned, human-readable transcription
+  "raw_text": <string>               // closer-to-verbatim; may match content
+}}
+
+Optional:
+- "places": [ <string>, ... ]        // distinct place names
+- "notes": <string or null>
+
+=========================
+TRANSCRIPTION GUIDELINES
+=========================
+
+- Be as faithful as possible to the handwriting / print.
+- Do NOT invent people, places, or events that are not present.
+- Preserve line breaks where helpful, but you may unwrap multi-column
+  registers into a more linear reading order.
+- Do NOT modernize spelling (keep "betwixt", "ye", etc.).
+- You may expand obvious abbreviations when confident, but keep the
+  original nearby (e.g. "Presb." → "Presbyterian (Presb.)").
+
+=========================
+DICTIONARY / HINTS (SOFT)
+=========================
+
+Use these hints to reduce hallucinations and help with ambiguous letters:
+
+- Common surnames in this corpus:
+  {surnames_str}
+
+- Important places and churches:
+  {places_str}
+
+- Additional church terms / organizations:
+  {church_terms_str}
+
+- Military / Civil War vocabulary:
+  {military_str}
+
+- Honorifics / titles (religious, civic, military, generic):
+  {honorifics_str}
+
+Do NOT force text to match hints; they are only suggestions.
+
+=========================
+QUALITY FLAG
+=========================
+
+transcription_quality:
+- "high"   → clear text, very confident
+- "medium" → mostly legible with some uncertain phrases
+- "low"    → heavily damaged, many gaps or uncertain words
+
+=========================
+CONSTRAINTS
+=========================
+
+- The ONLY JSON must be between:
+
+  ---BEGIN_JSON---
+  {{ ... }}
+  ---END_JSON---
+
+- No comments inside JSON, no trailing commas.
+- No images or binary data in JSON.
+""".strip()
+
+
+def build_user_prompt(page_number: int, layout_type: str, quadrant_label: Optional[str]) -> str:
+    """
+    Load user prompt template from external file if present, otherwise fall back
+    to inline prompt. External template can use {{page_number}}, {{layout_type}},
+    {{quadrant_label}} placeholders.
+    """
+    q_label_text = f"(quadrant {quadrant_label})" if quadrant_label else ""
+    if USER_PROMPT_PATH.exists():
+        try:
+            tmpl = USER_PROMPT_PATH.read_text(encoding="utf-8")
+            logger.info(f"[PROMPTS] Using external user prompt: {USER_PROMPT_PATH}")
+            # Simple placeholder replacement (avoid .format because of JSON braces)
+            tmpl = tmpl.replace("{{page_number}}", str(page_number))
+            tmpl = tmpl.replace("{{layout_type}}", layout_type)
+            tmpl = tmpl.replace("{{quadrant_label}}", q_label_text)
+            return tmpl
+        except Exception as e:
+            logger.warning(f"[PROMPTS] Failed to read user prompt file: {e}")
+
+    logger.info("[PROMPTS] Using built-in user prompt fallback")
+    q_part = f"quadrant/region {quadrant_label} of " if quadrant_label else ""
+    return f"""
+You are transcribing {q_part}page {page_number} of a bound church record volume.
+
+CONTEXT:
+- These images are PUBLIC-DOMAIN historical ledgers from the 1700s–1800s.
+- All people mentioned are long deceased.
+- There is no modern personal data or privacy risk.
+- Do NOT refuse. Do NOT apologize. Do NOT output safety warnings.
+
+LAYOUT:
+- Layout classification for this page: "{layout_type}".
+- The images you see are all from THIS same logical unit ({q_part}page {page_number}).
+- Combine all image tiles you receive into one coherent transcription for this unit.
+
+TASK:
+1) Carefully read ALL tiles.
+2) Produce an accurate transcription and light structural metadata.
+3) Then output EXACTLY ONE JSON OBJECT between:
+
+   ---BEGIN_JSON---
+   {{ ... }}
+   ---END_JSON---
+
+The JSON MUST follow the schema from the system prompt, including:
+- page_number, quadrant_label, page_title, page_type, record_type, page_date_hint
+- content, raw_text
+- transcription_method, transcription_quality
+
+Do NOT produce any text outside the JSON markers.
+""".strip()
+
+# -------------------------
+# OpenAI client
+# -------------------------
+
+
+def get_client() -> OpenAI:
+    load_dotenv()
+    client = OpenAI()
+    if not client.api_key:
+        raise RuntimeError("You must set OPENAI_API_KEY environment variable")
+    return client
+
+# -------------------------
+# Refusal / safety artifact scrubber
+# -------------------------
+
+REFUSAL_SNIPPETS = [
+    "i'm unable to transcribe",
+    "i am unable to transcribe",
+    "i cannot transcribe",
+    "i can't transcribe",
+    "i am not able to transcribe",
+    "unable to transcribe the content from the image provided",
+    "unable to transcribe any text from the provided image",
+    "appears to be blank or contains no discernible text",
+    "if you have another image or need further assistance",
+    "as an ai language model",
+    "as a large language model",
+    "i'm unable to comply",
+    "i'm sorry, i can't assist with that",
+    "i cannot assist with that request",
+    "i can't help with that request",
+]
+
+
+def strip_refusal_meta(text: str) -> str:
+    """
+    Remove meta-comment / refusal / boilerplate lines from OCR output.
+    This is only meant to strip model self-talk, not real ledger content.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    lines = text.splitlines()
+    kept: List[str] = []
+
+    for line in lines:
+        lower = line.lower().strip()
+        if not lower:
+            kept.append(line)
+            continue
+
+        if any(snip in lower for snip in REFUSAL_SNIPPETS):
+            continue
+
+        kept.append(line)
+
+    # collapse excessive blank runs to ≤2
+    cleaned: List[str] = []
+    blank_run = 0
+    for line in kept:
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run <= 2:
+                cleaned.append(line)
+        else:
+            blank_run = 0
+            cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+
+def scrub_refusals_in_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply refusal scrubbing to key text fields in the page JSON.
+    """
+    for field in ["content", "raw_text", "page_title", "notes"]:
+        if field in data and isinstance(data[field], str):
+            data[field] = strip_refusal_meta(data[field])
+    return data
+
+# -------------------------
+# JSON extraction
+# -------------------------
+
+
+def extract_json_from_markers(
+    text: str,
+    page_number: int,
+    quadrant_label: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Try, in order:
+      1) JSON between ---BEGIN_JSON--- / ---END_JSON---
+      2) Whole response as JSON if it starts with "{" and ends with "}"
+      3) First {...} block found in the text
+
+    If all of those fail but there is non-empty text, wrap that text into
+    a minimal JSON object instead of failing.
+
+    Then scrub obvious meta-comment / refusal sentences from content/raw_text.
+    """
+    raw_json: Optional[str] = None
+
+    # 1) Explicit markers
+    m = re.search(r"---BEGIN_JSON---(.*?)---END_JSON---", text, re.DOTALL)
+    if m:
+        raw_json = m.group(1).strip()
+    else:
+        # 2) Entire response might be JSON
+        candidate = text.strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            raw_json = candidate
+        else:
+            # 3) First {...} block anywhere in text
+            brace = re.search(r"\{.*\}", text, re.DOTALL)
+            if brace:
+                raw_json = brace.group(0).strip()
+
+    if raw_json is None:
+        stripped = text.strip()
+        if not stripped:
+            raise ValueError("No JSON block found in model output")
+
+        logger.warning(
+            f"[JSON_FALLBACK] Page {page_number} "
+            f"{quadrant_label or 'whole'}: no JSON found; "
+            "wrapping raw text into minimal JSON stub."
+        )
+
+        stripped_clean = strip_refusal_meta(stripped)
+
+        data: Dict[str, Any] = {
+            "page_number": page_number,
+            "quadrant_label": quadrant_label,
+            "page_title": None,
+            "page_type": "ledger",
+            "record_type": "ledger",
+            "page_date_hint": None,
+            "transcription_method": TRANSCRIPTION_VERSION + "-raw-wrap",
+            "transcription_quality": "low",
+            "content": stripped_clean,
+            "raw_text": stripped_clean,
+            "places": [],
+        }
+        return data
+
+    # Normal JSON path
+    data = json.loads(raw_json)
+
+    data.setdefault("page_number", page_number)
+    data.setdefault("quadrant_label", quadrant_label)
+    data.setdefault("transcription_method", TRANSCRIPTION_VERSION)
+    data.setdefault("transcription_quality", "medium")
+
+    if "content" not in data and "raw_text" in data:
+        data["content"] = data["raw_text"]
+    if "raw_text" not in data and "content" in data:
+        data["raw_text"] = data["content"]
+
+    data.setdefault("content", "")
+    data.setdefault("raw_text", data.get("content", ""))
+
+    # scrub meta-comment / refusal chatter
+    data["content"] = strip_refusal_meta(data.get("content", ""))
+    data["raw_text"] = strip_refusal_meta(data.get("raw_text", ""))
+
+    for fld in ["page_title", "page_type", "record_type", "page_date_hint"]:
+        data.setdefault(fld, None)
+
+    places = data.get("places")
+    norm_places: List[str] = []
+    if isinstance(places, list):
+        for p in places:
+            if isinstance(p, str):
+                norm_places.append(p.strip())
+            elif isinstance(p, dict) and "name" in p:
+                norm_places.append(str(p["name"]).strip())
+    data["places"] = norm_places
+
+    return data
+
+# -------------------------
+# Vision call (now FIFO via global queue)
+# -------------------------
+
+
+def call_vision_for_tiles(
+    client: OpenAI,
+    page_number: int,
+    tiles: List[Image.Image],
+    layout_type: str,
+    quadrant_label: Optional[str],
+    model: str,
+) -> Dict[str, Any]:
+    """
+    Call the Vision model for one logical unit (whole page or one quadrant/region).
+
+    IMPORTANT:
+    - All OpenAI calls go through a single global FIFO queue.
+    - Exactly one API call is in-flight at any time.
+    - Quadrants/regions across all pages are strictly serialized.
+    """
+    # Ensure global worker exists
+    start_global_api_worker(client)
+
+    sys_prompt = build_system_prompt()
+    user_prompt = build_user_prompt(page_number, layout_type, quadrant_label)
+
+    message_content: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+    for tile in tiles:
+        message_content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": image_to_data_url(tile),
+                "detail": "high",
+            },
+        })
+
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": message_content},
+    ]
+
+    label = quadrant_label or "whole-page"
+    logger.info(f"Page {page_number} {label}: enqueuing API call")
+
+    def _task():
+        logger.info(f"Page {page_number} {label}: starting API call (in worker)")
+        resp = _do_openai_call(client, model, messages)
+        msg = resp.choices[0].message
+
+        if isinstance(msg.content, str):
+            assistant_text = msg.content
+        else:
+            parts_text: List[str] = []
+            for part in msg.content:
+                if getattr(part, "type", None) == "text":
+                    parts_text.append(part.text)
+            assistant_text = "".join(parts_text)
+        return assistant_text.strip()
+
+    # enqueue FIFO, block until that one finishes
+    assistant_text = ""
+    try:
+        assistant_text = enqueue_api_call(_task)
+    except Exception as e:
+        logger.error(f"Page {page_number} {label}: API call failed: {e}")
+        raise
+
+    if not assistant_text:
+        raise ValueError(f"Empty assistant_text from model for page {page_number} {label}")
 
     try:
-        if DRY_RUN:
-            # In dry-run mode, DO NOT call OpenAI.
-            result = {
-                "page_number": page_number,
-                "page_title": f"Page {page_number}",
-                "content": "",
-                "raw_text": "",
-                "extracted_names": [],
-                "extracted_dates": [],
-                "identified_roles": {},
-                "tags": [],
-                "military_service": default_military_service(),
-                "page_date": None,
-                "page_locations": [],
-                "strip_mode": mode,
-                "strips_used": strips_planned,
-                "dry_run": True,
-            }
-        else:
-            im = Image.open(img_path)
-            im = resize_for_ocr(im)  # size-limited version for OCR
-            w, h = im.size
-
-            if strips_planned <= 1:
-                buf = _image_to_bytes(im)
-                result = ocr_with_openai(buf, img_path.name)
-            else:
-                boxes = compute_strip_boxes(w, h, strips_planned, STRIP_OVERLAP)
-                combined_content = []
-                combined_raw = []
-                extracted_names: List[str] = []
-                extracted_dates: List[Dict[str, Any]] = []
-                identified_roles: Dict[str, Any] = {}
-                tags: List[str] = []
-                military_blocks: List[Dict[str, Any]] = []
-                page_date = None
-                page_locations = []
-
-                for idx, box in enumerate(boxes):
-                    left, top, right, bottom = box
-                    strip = im.crop(box)
-                    strip_filename = f"{img_path.stem}_strip_{idx+1}.png"
-                    strip_path = PER_PAGE_DIR / strip_filename
-                    strip.save(strip_path)
-
-                    buf = _image_to_bytes(strip)
-                    data = ocr_with_openai(buf, strip_filename)
-
-                    if isinstance(data, dict):
-                        content = data.get("content") or ""
-                        raw_text = data.get("raw_text") or data.get("transcription") or ""
-                        if content:
-                            combined_content.append(content)
-                        if raw_text:
-                            combined_raw.append(raw_text)
-
-                        extracted_names.extend(data.get("extracted_names") or [])
-                        extracted_dates.extend(data.get("extracted_dates") or [])
-                        tags.extend(data.get("tags") or [])
-
-                        ir = data.get("identified_roles") or {}
-                        for k, v in ir.items():
-                            if k not in identified_roles:
-                                identified_roles[k] = v
-                            else:
-                                existing = identified_roles[k]
-                                if isinstance(existing, list):
-                                    new_roles = v if isinstance(v, list) else [v]
-                                    for r in new_roles:
-                                        if r not in existing:
-                                            existing.append(r)
-                                else:
-                                    new_list = [existing]
-                                    new_roles = v if isinstance(v, list) else [v]
-                                    for r in new_roles:
-                                        if r not in new_list:
-                                            new_list.append(r)
-                                    identified_roles[k] = new_list
-
-                        if data.get("military_service"):
-                            military_blocks.append(data["military_service"])
-
-                        if data.get("page_date"):
-                            page_date = data["page_date"]
-                        if data.get("page_locations"):
-                            page_locations = data["page_locations"]
-
-                page_military = merge_military_blocks(military_blocks)
-
-                result = {
-                    "page_number": page_number,
-                    "page_title": f"Page {page_number}",
-                    "content": "\n\n".join(combined_content).strip(),
-                    "raw_text": "\n\n".join(combined_raw).strip(),
-                    "extracted_names": sorted(set(extracted_names)),
-                    "extracted_dates": extracted_dates,
-                    "identified_roles": identified_roles,
-                    "tags": sorted(set(tags)),
-                    "military_service": page_military,
-                    "page_date": page_date,
-                    "page_locations": page_locations,
-                    "strip_mode": mode,
-                    "strips_used": strips_planned,
-                    "dry_run": False,
-                }
-
-        if isinstance(result, dict):
-            if "page_number" not in result or result["page_number"] in (None, -1):
-                result["page_number"] = page_number
-            if "page_title" not in result:
-                result["page_title"] = f"Page {page_number}"
-
-        per_page_json_path = OCR_OUTPUT_DIR / f"{img_path.stem}.json"
-        with per_page_json_path.open("w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-
-        append_jsonl(OUTPUT_JSONL, result)
-
-        write_complexity_row(COMPLEXITY_LOG, complexity_row)
-        return result
-
+        data = extract_json_from_markers(
+            assistant_text,
+            page_number,
+            quadrant_label,
+        )
+        return data
     except Exception as e:
-        print(f"[ERROR] Failed to process page {img_path}: {e}")
-        traceback.print_exc()
-        complexity_row["error"] = str(e)
-        write_complexity_row(COMPLEXITY_LOG, complexity_row)
+        # Debug dump of raw model output (best-effort)
+        try:
+            debug_label = quadrant_label or "whole"
+            debug_path = OUTPUT_DIR / f"page-{page_number}_{debug_label}_raw.txt"
+            with debug_path.open("w", encoding="utf-8") as dbg:
+                dbg.write(assistant_text or "")
+            logger.info(f"[DEBUG] Saved raw model output to {debug_path}")
+        except Exception as dbg_e:
+            logger.warning(f"[DEBUG] Failed to write debug output: {dbg_e}")
+
+        raise
+
+# -------------------------
+# Simple sweeper (places, people, events with links)
+# -------------------------
+def is_non_name_trailer(tok: str) -> bool:
+    """
+    Tokens that look like dates, months, or obvious non-name words
+    that should be stripped off the end of a name phrase.
+    """
+    t = tok.strip(".,;:()").lower()
+    if not t:
+        return True
+    if t in MONTH_TOKENS:
+        return True
+    if t in NON_NAME_TRAILERS:
+        return True
+    # Pure digits (years / days)
+    if re.fullmatch(r"\d+", t):
+        return True
+    # Apostrophe-year like '79, '86
+    if re.fullmatch(r"'?\d{2}", t):
+        return True
+    return False
+# Tokens that should never be treated as surnames (month names / abbreviations, etc.)
+
+# Tokens that should never be treated as surnames (month names / abbreviations, etc.)
+MONTH_TOKENS = {
+    "jan", "jan.", "january",
+    "feb", "feb.", "february",
+    "mar", "mar.", "march",
+    "apr", "apr.", "april",
+    "may",
+    "jun", "jun.", "june",
+    "jul", "jul.", "july",
+    "aug", "aug.", "august",
+    "sep", "sept", "sept.", "september",
+    "oct", "oct.", "october",
+    "nov", "nov.", "november",
+    "dec", "dec.", "december",
+}
+
+# Extra words that often appear right after names but are NOT part of the name
+# (including churchy and ledger-ish noise)
+NON_NAME_TRAILERS = {
+    "ceased",
+    "removed",
+    "attending",
+    "daughter",
+    "son",
+    "wife",
+    "husband",
+    "baptists",
+    "church",
+    "cert.",
+    "cert",
+    "ex.",
+    "ex",
+    "ext",
+
+    # geography / jurisdiction
+    "co", "co.", "county",
+    "tp", "tp.", "twp", "twp.", "twsp", "twsp.", "township",
+    "ward",
+    "pa", "pa.", "pennsylvania",
+    "ohio", "virginia", "va", "wv",
+
+    # structural / meeting junk
+    "meeting", "minutes", "session", "adjourned",
+
+    # other generic junk
+    "etc",
+}
+
+
+DATE_RE = re.compile(
+    r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|"
+    r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[,/]\s*\d{2,4})?\b"
+)
+YEAR_RE = re.compile(r"\b(17|18|19)\d{2}\b")
+
+
+def sweep_places(text: str, initial_places: List[str]) -> List[Dict[str, Any]]:
+    """
+    Very light place sweep:
+
+    - Start from COMBINED_PLACES (defaults + dictionary_hints).
+    - Include any initial_places passed in from the model.
+    - Also sniff simple 'X Township / X Tp. / X Co.' patterns.
+    - Down-rank ambiguous things like 'Elizabeth' if the corpus
+      says they're mostly used as first names.
+    """
+    found: Dict[str, str] = {}
+    lowered = text.lower()
+
+    stats = build_name_town_stats()
+
+    def _should_skip_place(name: str) -> bool:
+        norm = normalize_token(name)
+        if norm not in AMBIGUOUS_PLACE_NAMES:
+            return False
+        info = stats.get(norm)
+        if not info:
+            return False
+        # If we've *never* seen it as a place but have seen it as a first name,
+        # treat it as "probably a person, not a town" and skip.
+        if info["as_place"] == 0 and info["as_person_first"] > 0:
+            logger.debug(
+                f"[PLACES] Skipping ambiguous place '{norm}' "
+                f"(person_first={info['as_person_first']}, place={info['as_place']})"
+            )
+            return True
+        return False
+
+    # Dictionary / hints
+    for place in COMBINED_PLACES:
+        if not place:
+            continue
+        if place.lower() not in lowered:
+            continue
+        if _should_skip_place(place):
+            continue
+        found[place] = ""
+
+    # Anything the model already tagged as a place
+    for p in initial_places:
+        if not p:
+            continue
+        if _should_skip_place(p):
+            continue
+        found.setdefault(p, "")
+
+    # Simple regex for "X Township / X Tp. / X Co."
+    # e.g. "Scott Township", "Snowden Tp.", "Lawrence Co."
+    township_re = re.compile(
+        r"\b([A-Z][a-zA-Z]+)\s+(Township|Tp\.|Tp|Twp\.|Twp|Twsp\.|Twsp)\b"
+    )
+    county_re = re.compile(r"\b([A-Z][a-zA-Z]+)\s+Co\.?\b")
+
+    for m in township_re.finditer(text):
+        base = m.group(1)
+        label = f"{base} Township"
+        if not _should_skip_place(label):
+            found.setdefault(label, "")
+
+    for m in county_re.finditer(text):
+        base = m.group(1)
+        label = f"{base} County"
+        if not _should_skip_place(label):
+            found.setdefault(label, "")
+
+    return [{"name": name, "notes": notes or None} for name, notes in sorted(found.items())]
+
+def sweep_people(text: str) -> List[Dict[str, Any]]:
+    """
+    Very light people sweep: honorific + capitalized name.
+
+    Improvements:
+    - Collapses internal newlines so "Miss Mary J.\\nMartin" → "Miss Mary J. Martin".
+    - Strips trailing tokens that look like dates/months or obvious non-name words
+      (e.g. "June", "Dec.", "'86", "Ceased", "Removed", "Baptists", etc.).
+    - Stops at prepositions like "of / from / in / at / to / by / with / for / and".
+    - Avoids treating ledger boilerplate like "Meeting adjourned" as a person.
+    """
+    people: Dict[str, Dict[str, Any]] = {}
+
+    honorific_union = "|".join(re.escape(h) for h in ALL_HONORIFICS)
+    # Grab "Honorific + the rest of the phrase on that line-ish"
+    pattern = rf"\b(?:{honorific_union})\s+[A-Z][^\n]*"
+
+    for m in re.finditer(pattern, text):
+        raw_full = m.group(0)
+
+        # Collapse whitespace/newlines → single spaces
+        norm_full = " ".join(raw_full.split()).strip()
+        if not norm_full:
+            continue
+
+        tokens = norm_full.split()
+        if len(tokens) < 2:
+            # Honorific only, no name
+            continue
+
+        honorific = tokens[0]
+        rest_tokens = tokens[1:]
+
+        # Build the "real" name tokens, stopping when we hit non-name stuff
+        name_tokens: List[str] = []
+        for tok in rest_tokens:
+            base = tok.strip(",.;:()")
+            if not base:
+                break
+
+            lower = base.lower()
+
+            # If the word is clearly structural or "not a name", stop
+            if is_non_name_trailer(base):
+                break
+
+            # Stop at common prepositions; they typically start the "of Washington Co."
+            # or "of Bethel Church" clause.
+            if lower in {"of", "from", "in", "at", "on", "for", "by", "with", "and", "to"}:
+                break
+
+            # Names should start with a capital letter (simple heuristic)
+            if not re.match(r"^[A-Z]", base):
+                break
+
+            name_tokens.append(base)
+
+        if len(name_tokens) == 0:
+            # Everything after the honorific was junk / location / date
+            continue
+
+        # Guard against weird "Meeting / Session / Minutes" as first token
+        if name_tokens[0].lower() in {"meeting", "session", "minutes"}:
+            continue
+
+        full = " ".join([honorific] + name_tokens)
+        if full in people:
+            continue
+
+        given_name = name_tokens[0]
+        surname = name_tokens[-1] if len(name_tokens) >= 2 else None
+
+        # Infer church_role from the full snippet if possible
+        raw_lower = raw_full.lower()
+        church_role = None
+        if "pastor" in raw_lower:
+            church_role = "Pastor"
+        elif "elder " in raw_lower or "elder," in raw_lower:
+            church_role = "Elder"
+        elif "deacon" in raw_lower:
+            church_role = "Deacon"
+
+        people[full] = {
+            "full_name": full,
+            "given_name": given_name,
+            "surname": surname,
+            "honorific": honorific,
+            "church_role": church_role,
+            "is_military": any(
+                honorific.startswith(h) for h in HONORIFICS_MILITARY
+            ),
+            "military_rank": None,
+            "notes": None,
+            "confidence": 0.75,
+        }
+
+    return list(people.values())
+
+def _extract_year_from_string(s: str) -> Optional[int]:
+    m = YEAR_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except ValueError:
         return None
 
 
-# -------------------------------------------------------------------
-# Main orchestration
-# -------------------------------------------------------------------
+def sweep_events(
+    text: str,
+    people: List[Dict[str, Any]],
+    places: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Sweep for simple events and link them to people & places.
+
+    Event types:
+    - birth
+    - baptism
+    - marriage
+    - death
+    - other (e.g. purely military / service notes)
+
+    Extra:
+    - is_military flag based on COMBINED_MILITARY / ranks / battle keywords.
+    """
+    events: List[Dict[str, Any]] = []
+
+    sentences = re.split(r"(?:\n{2,}|(?<=[.!?])\s+)", text)
+    place_names = [p["name"] for p in places if isinstance(p, dict) and "name" in p]
+
+    military_terms = [kw.lower() for kw in COMBINED_MILITARY]
+    military_ranks = [r.lower().rstrip(".") for r in HONORIFICS_MILITARY]
+
+    for sent in sentences:
+        s = sent.strip()
+        if not s:
+            continue
+        lowered = s.lower()
+        event_type: Optional[str] = None
+
+        if any(w in lowered for w in ["born", "birth"]):
+            event_type = "birth"
+        elif any(w in lowered for w in ["baptized", "baptised", "baptism"]):
+            event_type = "baptism"
+        elif any(w in lowered for w in ["married", "marriage"]):
+            event_type = "marriage"
+        elif any(w in lowered for w in ["died", "dead", "deceased", "killed"]):
+            event_type = "death"
+
+        # Military flavor detection (independent of main type)
+        is_military = False
+        if any(term in lowered for term in military_terms):
+            is_military = True
+        if any(rank in lowered for rank in military_ranks):
+            is_military = True
+
+        # If nothing else classified this sentence but it's clearly military,
+        # treat as a generic "other" military event.
+        if event_type is None and is_military:
+            event_type = "other"
+
+        if not event_type:
+            continue
+
+        # Date / year
+        date_match = DATE_RE.search(s)
+        if date_match:
+            date = date_match.group(0)
+        else:
+            year_match = YEAR_RE.search(s)
+            date = year_match.group(0) if year_match else None
+
+        year: Optional[int] = None
+        if date:
+            year = _extract_year_from_string(date)
+        if year is None:
+            year = _extract_year_from_string(s)
+
+        # Place inference: first known place name that appears in the sentence
+        place_for_event = None
+        for pl in place_names:
+            if pl and pl.lower() in lowered:
+                place_for_event = pl
+                break
+
+        # People linking: by full_name first, then surname
+        people_for_event: Dict[str, Dict[str, Any]] = {}
+        for person in people:
+            full = person.get("full_name") or ""
+            if not full:
+                continue
+            tokens = full.split()
+            surname = tokens[-1] if len(tokens) >= 2 else None
+
+            if full in s:
+                people_for_event[full] = {
+                    "full_name": full,
+                    "match_type": "full",
+                }
+                continue
+
+            if surname:
+                if re.search(r"\b" + re.escape(surname) + r"\b", s):
+                    if full not in people_for_event:
+                        people_for_event[full] = {
+                            "full_name": full,
+                            "match_type": "surname",
+                        }
+
+        events.append({
+            "event_type": event_type,
+            "date": date,
+            "year": year,
+            "place": place_for_event,
+            "raw_entry": s,
+            "normalized_summary": f"{event_type.capitalize()} event: {s[:180]}{' …' if len(s) > 180 else ''}",
+            "is_military": is_military,
+            "people": list(people_for_event.values()),
+        })
+
+    return events
+
+def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run places/people/event sweeps on the combined page content.
+    """
+    text = data.get("content") or data.get("raw_text") or ""
+    text = text if isinstance(text, str) else str(text)
+
+    initial_places_raw = data.get("places") or []
+    initial_places: List[str] = []
+    for p in initial_places_raw:
+        if isinstance(p, str):
+            initial_places.append(p)
+        elif isinstance(p, dict) and "name" in p:
+            initial_places.append(str(p["name"]))
+
+    places_struct = sweep_places(text, initial_places)
+    people_struct = sweep_people(text)
+    events_struct = sweep_events(text, people_struct, places_struct)
+
+    data["places"] = places_struct
+    data["people"] = people_struct
+    data["events"] = events_struct
+    return data
+
+# -------------------------
+# OCR per page (adaptive + quadrants, with inner threads)
+# -------------------------
 
 
-def collect_page_files() -> List[Path]:
-    if not PAGES_DIR.exists():
-        print(f"[ERROR] PAGES_DIR does not exist: {PAGES_DIR}")
-        return []
-    files = sorted(PAGES_DIR.glob("*.png"))
-    return files
+def ocr_page(
+    client: OpenAI,
+    page: int,
+    im: Image.Image,
+    layout_type: str,
+) -> Dict[str, Any]:
+    """
+    For default layout: one call with tiled page (2x3).
+
+    For ledger/super_dense:
+      - If adaptive regions find several smaller blobs → region mode
+      - If adaptive finds one giant blob (covers most of page) → fixed 2x2 quadrant mode
+      - If no regions → fallback to single-call tiling
+
+    Within dense path, quadrants/regions are processed in parallel via
+    an inner ThreadPoolExecutor, but the actual OpenAI calls are serialized
+    by the global FIFO API queue.
+
+    NEW:
+    - Uses tile_is_mostly_blank(...) to skip huge empty quadrants/regions
+      (e.g. the long DISMISSED column on page 213).
+    """
+    w, h = im.size
+    area = w * h
+
+    # ---------- Dense / ledger path ----------
+    if layout_type in ("super_dense", "ledger"):
+        logger.info(
+            f"Page {page}: ADAPTIVE-REGION mode (layout={layout_type}), "
+            f"size={w}x{h} ({area} px)"
+        )
+        regions = find_text_regions(im, max_regions=6, min_area_ratio=0.003, pad=20)
+
+        if regions:
+            # ----- Case 1: single large region → fixed 2x2 quadrants -----
+            if len(regions) == 1:
+                x1, y1, x2, y2 = regions[0]
+                reg_area = (x2 - x1) * (y2 - y1)
+                coverage = reg_area / float(area)
+
+                if coverage >= 0.80:
+                    logger.info(
+                        f"Page {page}: single large region covering "
+                        f"{coverage:.2%} of page → using fixed 2x2 quadrant mode"
+                    )
+
+                    quadrants = tile_image(im, 2, 2)
+                    n_quads = len(quadrants)
+                    quadrant_results: List[Optional[Dict[str, Any]]] = [None] * n_quads
+
+                    max_inner_workers = min(4, n_quads)
+                    with ThreadPoolExecutor(max_workers=max_inner_workers) as ex:
+                        future_to_idx: Dict[Any, int] = {}
+
+                        for idx, quad_img in enumerate(quadrants):
+                            q_label = f"Q{idx + 1}"
+
+                            # Skip almost-empty quadrants (e.g. DISMISSED column)
+                            if tile_is_mostly_blank(quad_img):
+                                logger.info(
+                                    f"Page {page}: quadrant {q_label} looks mostly blank "
+                                    f"→ skipping Vision call"
+                                )
+                                quadrant_results[idx] = {
+                                    "page_number": page,
+                                    "quadrant_label": q_label,
+                                    "page_title": None,
+                                    "page_type": layout_type,
+                                    "record_type": None,
+                                    "page_date_hint": None,
+                                    "transcription_method": TRANSCRIPTION_VERSION + "-blank-quadrant",
+                                    "transcription_quality": "low",
+                                    "content": "",
+                                    "raw_text": "",
+                                    "places": [],
+                                }
+                                continue
+
+                                # If not blank, submit to Vision
+                            logger.info(
+                                f"Page {page}: submitting quadrant {q_label} (2x2 mode)"
+                            )
+                            fut = ex.submit(
+                                call_vision_for_tiles,
+                                client,
+                                page,
+                                [quad_img],
+                                layout_type,
+                                q_label,
+                                HEAVY_MODEL,
+                            )
+                            future_to_idx[fut] = idx
+
+                        # Collect Vision results
+                        for fut in as_completed(future_to_idx):
+                            idx = future_to_idx[fut]
+                            q_label = f"Q{idx + 1}"
+                            try:
+                                quadrant_results[idx] = fut.result()
+                                logger.info(f"Page {page}: quadrant {q_label} completed")
+                            except Exception as e:
+                                logger.error(
+                                    f"Page {page}: quadrant {q_label} FAILED: {e}"
+                                )
+                                raise
+
+                    # Merge quadrant results into a single page JSON
+                    base: Optional[Dict[str, Any]] = None
+                    for res in quadrant_results:
+                        if res is not None:
+                            base = res.copy()
+                            break
+                    if base is None:
+                        raise RuntimeError(f"Page {page}: all quadrants failed")
+
+                    merged_content_parts: List[str] = []
+                    merged_raw_parts: List[str] = []
+
+                    for q in quadrant_results:
+                        if q is None:
+                            continue
+                        c = q.get("content") or q.get("raw_text") or ""
+                        r = q.get("raw_text") or q.get("content") or ""
+                        if isinstance(c, str) and c.strip():
+                            merged_content_parts.append(c.strip())
+                        if isinstance(r, str) and r.strip():
+                            merged_raw_parts.append(r.strip())
+
+                    full_content = "\n\n".join(merged_content_parts)
+                    full_raw = "\n\n".join(merged_raw_parts) or full_content
+
+                    base["content"] = full_content
+                    base["raw_text"] = full_raw
+                    base["quadrant_label"] = None
+                    base["places"] = []
+
+                    return base
+
+            # ----- Case 2: multiple adaptive regions → region mode -----
+            logger.info(f"Page {page}: using {len(regions)} adaptive region(s)")
+            n_regions = len(regions)
+            region_results: List[Optional[Dict[str, Any]]] = [None] * n_regions
+
+            max_inner_workers = min(4, n_regions)
+            with ThreadPoolExecutor(max_workers=max_inner_workers) as ex:
+                future_to_idx: Dict[Any, int] = {}
+
+                for idx, box in enumerate(regions):
+                    left, top, right, bottom = box
+                    q_label = f"Q{idx + 1}"
+                    region_img = im.crop(box)
+
+                    # Skip almost-empty regions
+                    if tile_is_mostly_blank(region_img):
+                        logger.info(
+                            f"Page {page}: region {q_label} box={box} looks mostly blank "
+                            f"→ skipping Vision call"
+                        )
+                        region_results[idx] = {
+                            "page_number": page,
+                            "quadrant_label": q_label,
+                            "page_title": None,
+                            "page_type": layout_type,
+                            "record_type": None,
+                            "page_date_hint": None,
+                            "transcription_method": TRANSCRIPTION_VERSION + "-blank-region",
+                            "transcription_quality": "low",
+                            "content": "",
+                            "raw_text": "",
+                            "places": [],
+                        }
+                        continue
+
+                    logger.info(
+                        f"Page {page}: submitting region {q_label} box={box}"
+                    )
+                    fut = ex.submit(
+                        call_vision_for_tiles,
+                        client,
+                        page,
+                        [region_img],
+                        layout_type,
+                        q_label,
+                        HEAVY_MODEL,
+                    )
+                    future_to_idx[fut] = idx
+
+                # Collect Vision results
+                for fut in as_completed(future_to_idx):
+                    idx = future_to_idx[fut]
+                    q_label = f"Q{idx + 1}"
+                    try:
+                        region_results[idx] = fut.result()
+                        logger.info(f"Page {page}: region {q_label} completed")
+                    except Exception as e:
+                        logger.error(
+                            f"Page {page}: region {q_label} FAILED: {e}"
+                        )
+                        raise
+
+            base = None
+            for res in region_results:
+                if res is not None:
+                    base = res.copy()
+                    break
+            if base is None:
+                raise RuntimeError(f"Page {page}: all regions failed")
+
+            merged_content_parts: List[str] = []
+            merged_raw_parts: List[str] = []
+
+            for q in region_results:
+                if q is None:
+                    continue
+                c = q.get("content") or q.get("raw_text") or ""
+                r = q.get("raw_text") or q.get("content") or ""
+                if isinstance(c, str) and c.strip():
+                    merged_content_parts.append(c.strip())
+                if isinstance(r, str) and r.strip():
+                    merged_raw_parts.append(r.strip())
+
+            full_content = "\n\n".join(merged_content_parts)
+            full_raw = "\n\n".join(merged_raw_parts) or full_content
+
+            base["content"] = full_content
+            base["raw_text"] = full_raw
+            base["quadrant_label"] = None
+            base["places"] = []
+
+            return base
+
+        else:
+            logger.info(
+                f"Page {page}: no text regions detected; falling back to SINGLE-CALL tiling."
+            )
+
+    # ---------- Default / fallback single-call path ----------
+    rows, cols = LAYOUT_TILE_CONFIG["default"]
+    tiles = tile_image(im, rows, cols)
+    logger.info(
+        f"Page {page}: SINGLE-CALL mode layout={layout_type}, "
+        f"tiling={rows}x{cols}, size={w}x{h} ({area} px)"
+    )
+    model = HEAVY_MODEL if layout_type in ("ledger", "super_dense") else BASELINE_MODEL
+    data = call_vision_for_tiles(
+        client,
+        page,
+        tiles,
+        layout_type,
+        None,
+        model,
+    )
+    return data
+# -------------------------
+# Page processing + master JSONL
+# -------------------------
+
+
+def infer_layout(area: int, width: int, height: int) -> str:
+    aspect = width / max(1, height)
+    if area > 60_000_000:
+        return "super_dense"
+    if aspect > 1.6:
+        return "ledger"
+    return "default"
+
+
+def process_single_page(client: OpenAI, page: int) -> None:
+    try:
+        logger.info(f"=== Page {page} ===")
+        img_path: Optional[Path] = None
+
+        candidates = [
+            PAGES_DIR / f"{page}.png",
+            PAGES_DIR / f"page-{page}.png",
+            PAGES_DIR / f"{page}.jpg",
+            PAGES_DIR / f"page-{page}.jpg",
+            PAGES_DIR / f"{page}.jpeg",
+            PAGES_DIR / f"page-{page}.jpeg",
+        ]
+        for c in candidates:
+            if c.exists():
+                img_path = c
+                break
+        if not img_path:
+            raise FileNotFoundError(f"No image found for page {page} in {PAGES_DIR}")
+
+        with Image.open(img_path) as im:
+            im.load()
+            orig_w, orig_h = im.size
+            area = orig_w * orig_h
+            layout_type = infer_layout(area, orig_w, orig_h)
+            logger.info(
+                f"Page {page} → layout={layout_type}, size={orig_w}x{orig_h} ({area} px)"
+            )
+
+            im2, downscaled = maybe_downscale(im)
+            if downscaled:
+                w2, h2 = im2.size
+                logger.info(
+                    f"Page {page}: using downscaled image {w2}x{h2} ({w2*h2} px) for OCR"
+                )
+
+            data = ocr_page(client, page, im2, layout_type)
+
+        # scrub safety/refusal artifacts from LLM output
+        data = scrub_refusals_in_data(data)
+
+        # local sweeper (places/people/events)
+        data = apply_local_sweeper(data)
+
+        out_path = OUTPUT_DIR / f"page-{page}.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"Page {page}: saved structured JSON")
+
+    except Exception as e:
+        err_path = OUTPUT_DIR / f"page-{page}_raw_broken.json"
+        with err_path.open("w", encoding="utf-8") as f:
+            json.dump({"page_number": page, "error": str(e)}, f, ensure_ascii=False, indent=2)
+        logger.error(f"Page {page}: FAILED → {e}")
+
+
+def rebuild_master_jsonl() -> None:
+    logger.info("Rebuilding Master JSONL...")
+    page_files: List[Path] = []
+    for p in sorted(OUTPUT_DIR.glob("page-*.json")):
+        if p.name.endswith("_raw_broken.json"):
+            continue
+        page_files.append(p)
+
+    count = 0
+    with MASTER_JSONL.open("w", encoding="utf-8") as out:
+        for p in page_files:
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                count += 1
+            except Exception as e:
+                logger.warning(f"[REBUILD] Failed to include {p.name}: {e}")
+
+    logger.info(f"[REBUILD] Master JSONL rebuilt with {count} pages at {MASTER_JSONL}")
+
+# -------------------------
+# Main
+# -------------------------
 
 
 def main() -> None:
-    print(f"[INFO] PAGES_DIR      = {PAGES_DIR}")
-    print(f"[INFO] OUTPUT_JSONL   = {OUTPUT_JSONL}")
-    print(f"[INFO] PER_PAGE_DIR   = {PER_PAGE_DIR}")
-    print(f"[INFO] OCR_OUTPUT_DIR = {OCR_OUTPUT_DIR}")
-    print(f"[INFO] MAX_WORKERS    = {MAX_WORKERS}")
-    print(f"[INFO] USE_STRIPS     = {USE_STRIPS}")
-    print(f"[INFO] AUTO_STRIP_MODE= {AUTO_STRIP_MODE}")
-    print(f"[INFO] DRY_RUN        = {DRY_RUN}")
-    print()
-
-    files = collect_page_files()
-    if not files:
-        print("[ERROR] No PNG files found in PAGES_DIR.")
-        sys.exit(1)
-
-    print(f"[INFO] Found {len(files)} page candidates.")
-
-    filtered: List[Path] = []
-    for p in files:
-        page_number = extract_page_number(p)
-        if START_PAGE is not None and page_number != -1 and page_number < START_PAGE:
-            continue
-        if END_PAGE is not None and page_number != -1 and page_number > END_PAGE:
-            continue
-        filtered.append(p)
-
-    print(f"[INFO] After range filter: {len(filtered)} pages will be processed.")
-
-    if not filtered:
-        print("[WARN] No pages matched the specified range. Exiting.")
+    client = get_client()
+    pages = parse_page_list()
+    if not pages:
+        logger.error("[MAIN] No pages to process. Set PAGE_LIST or add PNGs to pages/")
         return
 
-    print(f"[INFO] Writing/append JSONL to: {OUTPUT_JSONL}")
-    print(f"[INFO] Complexity log at: {COMPLEXITY_LOG}")
-    print()
-
-    start_time = time.time()
-    results: List[Optional[Dict[str, Any]]] = []
+    logger.info(f"Processing pages: {pages}")
+    logger.info(f"Using baseline model: {BASELINE_MODEL}, heavy model: {HEAVY_MODEL}")
+    logger.info(f"dictionary_hints.json present: {HINTS_FILE.exists()}")
+    logger.info(f"Using up to {MAX_WORKERS} worker threads")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_path = {executor.submit(process_page, p): p for p in filtered}
-        for future in as_completed(future_to_path):
-            p = future_to_path[future]
+        future_to_page = {
+            executor.submit(process_single_page, client, page): page
+            for page in pages
+        }
+        for fut in as_completed(future_to_page):
+            p = future_to_page[fut]
             try:
-                res = future.result()
-                results.append(res)
+                fut.result()
             except Exception as e:
-                print(f"[ERROR] Exception while processing {p}: {e}")
-                traceback.print_exc()
+                logger.error(f"[MAIN] Page {p} crashed in worker: {e}")
 
-    elapsed = time.time() - start_time
-    processed_count = sum(1 for r in results if r is not None)
-    print()
-    print("==============================================")
-    print(" OCR RUN COMPLETE")
-    print("==============================================")
-    print(f"  Pages processed successfully: {processed_count}")
-    print(f"  Total pages attempted:        {len(filtered)}")
-    print(f"  Elapsed time (seconds):       {elapsed:.1f}")
-    print(f"  DRY_RUN                       : {DRY_RUN}")
-    print("==============================================")
-    print()
+    rebuild_master_jsonl()
 
 
 if __name__ == "__main__":
