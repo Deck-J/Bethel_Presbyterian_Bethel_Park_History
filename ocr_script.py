@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bethel OCR / ICR Pipeline
-Version: 2.37 (Adaptive + Quadrants + FIFO API Queue + Events w/ People & Places + External Prompts)
+Version: 2.41 (NameExtractor + Financial Sweeper + Stats-based Name Filter)
 
 Features:
 - Vision OCR via OpenAI (gpt-4o-mini / gpt-4o)
@@ -15,22 +15,21 @@ Features:
 - For default pages:
     * Single Vision call on 2x3 tiles
 - Strong prompts (system + user), now loaded from external files if present:
-    * prompts/ocr_system_prompt_v2.37.txt
+    * prompts/ocr_system_prompt_v2.37.txt (still honored)
     * prompts/ocr_user_prompt_v2.37.txt
 - Tolerant JSON extraction:
     * Markers, bare JSON, first {...}
     * If none → wrap raw text into minimal JSON stub
-- Local post-processing:
-    * Places / people / events sweeper (lightweight)
-    * Events linked to people (full name / surname) and places, with dates/years
-    * Ambiguous names (e.g. Elizabeth) down-ranked as places if corpus shows
-      they overwhelmingly occur as first names, not towns
-- Page-level parallelism with ThreadPoolExecutor
+- Local post-processing (v2.41):
+    * NameExtractor with statistical name filter (based on corpus + hints)
+    * Place sweeper from dictionary hints
+    * Event sweeper with tighter multi-war military detection
+    * Financial sweeper for $ / monetary lines
 - Refusal / safety boilerplate scrubber on content/raw_text
-- Global FIFO queue for ALL OpenAI calls:
-    * Exactly one in-flight API call at a time
-    * Strictly ordered across all pages/quadrants
-    * Exponential backoff for rate limits / transient failures
+- Global FIFO queue for ALL OpenAI calls
+- Page-level processing is now sequential:
+    * One page at a time
+    * That page may still use inner threads for quadrants/regions
 """
 
 import os
@@ -43,7 +42,7 @@ import warnings
 import threading
 
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Thread, Event
@@ -97,7 +96,7 @@ MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "4"))
 
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "90000000"))
 
-TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.37"
+TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.41"
 
 LAYOUT_TILE_CONFIG = {
     "default": (2, 3),   # rows, cols
@@ -128,13 +127,11 @@ def _do_openai_call(client: OpenAI, model: str, messages: List[Dict[str, Any]]):
             )
         except Exception as e:
             msg = str(e)
-            # crude but robust: look for rate-limit / 429 hints
             is_rate_limit = (
                 "429" in msg or
                 "rate limit" in msg.lower() or
                 "too many requests" in msg.lower()
             )
-            # transient-ish errors we might want to retry
             is_transient = any(
                 kw in msg.lower()
                 for kw in ["timeout", "temporarily unavailable", "try again", "server error"]
@@ -149,18 +146,16 @@ def _do_openai_call(client: OpenAI, model: str, messages: List[Dict[str, Any]]):
                 delay *= 2.0
                 continue
 
-            # no retry or final attempt → re-raise
             logger.error(f"[OPENAI_CALL] final failure on attempt {attempt}: {msg}")
             raise
 
-    # Should be unreachable
     raise RuntimeError("Unreachable: exhausted retries in _do_openai_call")
 
 
 def start_global_api_worker(client: OpenAI) -> None:
     """
     Start a single global worker thread that consumes tasks from GLOBAL_API_QUEUE.
-    Each task is a tuple: (callable, args, kwargs, promise_dict).
+    Each task: (callable, args, kwargs, promise_dict)
     """
     global GLOBAL_API_WORKER_STARTED
 
@@ -185,7 +180,6 @@ def start_global_api_worker(client: OpenAI) -> None:
                 except Exception as e:
                     promise["error"] = e
                 finally:
-                    # wake up the waiting thread
                     promise["event"].set()
                     GLOBAL_API_QUEUE.task_done()
 
@@ -196,14 +190,12 @@ def start_global_api_worker(client: OpenAI) -> None:
 def enqueue_api_call(func, *args, **kwargs):
     """
     Put a single API call into the global FIFO queue and block until it's done.
-    Returns: the value that func(*args, **kwargs) produced or raises its exception.
+    Returns: func(*args, **kwargs) or raises its exception.
     """
     event = Event()
     promise = {"event": event, "result": None, "error": None}
 
     GLOBAL_API_QUEUE.put((func, args, kwargs, promise))
-
-    # Blocking wait until worker finishes this task and signals via the Event
     event.wait()
 
     if promise["error"] is not None:
@@ -214,54 +206,6 @@ def enqueue_api_call(func, *args, **kwargs):
 # -------------------------
 # Dictionaries / hints
 # -------------------------
-
-DEFAULT_SURNAMES = [
-    "Marshall", "Miller", "McMillan", "Millar", "Clark", "Calhoun",
-    "Fleming", "Sample", "Dimmon", "Dimmond", "Fairchild",
-    "Elliott", "Elliot", "Hill", "Kelly", "Smith", "Jones",
-    "Hutchison", "Hutchinson", "McFarland", "Anderson",
-]
-
-DEFAULT_PLACES = [
-    "Bethel", "Bethel Church", "Bethel Cemetery", "Pittsburgh",
-    "Allegheny", "Minisink", "Deckertown", "Petersburgh",
-    "Wilderness", "Antietam", "Gettysburg", "Virginia",
-    "Augusta Stone Church", "Westmoreland", "Washington County",
-]
-
-HONORIFICS_RELIGIOUS = [
-    "Rev.", "Revd.", "Pastor", "Elder", "Ruling Elder",
-    "Deacon", "Moderator", "Clerk", "Trustee"
-]
-
-HONORIFICS_CIVIC = ["Dr.", "Esq.", "Hon.", "Judge"]
-
-HONORIFICS_MILITARY = [
-    "Col.", "Colonel", "Capt.", "Captain", "Lieut.", "Lt.",
-    "Sgt.", "Sergeant", "Corp.", "Corporal", "Pvt.", "Private",
-    "Gen.", "General"
-]
-
-HONORIFICS_GENERIC = ["Mr.", "Mrs.", "Miss"]
-
-DEFAULT_MILITARY_KEYWORDS = [
-    "Civil War", "war", "regiment", "company", "Co.",
-    "killed", "wounded", "died", "battle", "camp",
-    "Petersburgh", "Petersburg", "Wilderness", "Gettysburg",
-    "Antietam", "Chancellorsville",
-    "army", "infantry", "artillery", "cavalry",
-    "battery", "brigade", "division",
-    "volunteers", "volunteer",
-    "mustered", "enlisted", "discharged",
-    "prisoner", "captured",
-]
-ALL_HONORIFICS = (
-    HONORIFICS_RELIGIOUS
-    + HONORIFICS_CIVIC
-    + HONORIFICS_MILITARY
-    + HONORIFICS_GENERIC
-)
-
 
 def load_hints() -> Dict[str, Any]:
     if not HINTS_FILE.exists():
@@ -285,92 +229,145 @@ def load_hints() -> Dict[str, Any]:
 
 HINTS = load_hints()
 
+# default lists as safety net
+DEFAULT_SURNAMES = [
+    "Marshall", "Miller", "McMillan", "Millar", "Clark", "Calhoun",
+    "Fleming", "Sample", "Dimmon", "Dimmond", "Fairchild",
+    "Elliott", "Elliot", "Hill", "Kelly", "Smith", "Jones",
+    "Hutchison", "Hutchinson", "McFarland", "Anderson",
+]
+
+DEFAULT_PLACES = [
+    "Bethel", "Bethel Church", "Bethel Cemetery", "Pittsburgh",
+    "Allegheny", "Minisink", "Deckertown", "Petersburgh",
+    "Wilderness", "Antietam", "Gettysburg", "Virginia",
+    "Augusta Stone Church", "Westmoreland", "Washington County",
+]
+
+DEFAULT_MILITARY_KEYWORDS = [
+    "Civil War", "World War", "Revolutionary War",
+    "regiment", "company", "infantry", "artillery", "cavalry",
+    "battery", "brigade", "division",
+    "killed in battle", "killed in action", "wounded in battle",
+    "battle of", "camp", "army", "navy",
+]
+
+DEFAULT_HONORIFICS_RELIGIOUS = [
+    "Rev.", "Revd.", "Pastor", "Elder", "Ruling Elder",
+    "Deacon", "Moderator", "Clerk", "Trustee",
+]
+
+DEFAULT_HONORIFICS_CIVIC = ["Dr.", "Esq.", "Hon.", "Judge"]
+
+DEFAULT_HONORIFICS_MILITARY = [
+    "Col.", "Colonel", "Capt.", "Captain", "Lieut.", "Lt.",
+    "Sgt.", "Sergeant", "Corp.", "Corporal", "Pvt.", "Private",
+    "Gen.", "General",
+]
+
+DEFAULT_HONORIFICS_GENERIC = ["Mr.", "Mrs.", "Miss", "Ms."]
 
 def combined_list(base: List[str], extra: Optional[List[str]]) -> List[str]:
     if not extra:
         return sorted(set(base))
     return sorted(set(base + extra))
 
-
 COMBINED_SURNAMES = combined_list(DEFAULT_SURNAMES, HINTS.get("names"))
 COMBINED_PLACES = combined_list(DEFAULT_PLACES, HINTS.get("places"))
 COMBINED_CHURCH_TERMS = combined_list([], HINTS.get("church_terms"))
 COMBINED_MILITARY = combined_list(DEFAULT_MILITARY_KEYWORDS, HINTS.get("military_keywords"))
 
-# -------------------------
-# Ambiguous name/place frequency logic
-# -------------------------
+ALL_HONORIFICS: List[str] = combined_list(
+    DEFAULT_HONORIFICS_RELIGIOUS
+    + DEFAULT_HONORIFICS_CIVIC
+    + DEFAULT_HONORIFICS_MILITARY
+    + DEFAULT_HONORIFICS_GENERIC,
+    HINTS.get("honorifics")
+)
 
-# Names that can be both people and places – we treat them cautiously as "places"
-AMBIGUOUS_PLACE_NAMES = {
-    "Elizabeth",
-    "Washington",
-    "Madison",
-    "Florence",
-    "Charlotte",
+HONORIFICS_MILITARY = DEFAULT_HONORIFICS_MILITARY[:]  # used for is_military flags
+
+# Suffixes / prefixes / stopwords for NameExtractor
+NAME_SUFFIXES = [
+    "Jr.", "Sr.", "II", "III", "IV", "Esq.", "M.D.", "D.D.", "Ph.D."
+]
+SURNAME_PREFIXES = [
+    "Mc", "Mac", "O'", "Von", "Van", "De", "Del", "Della", "St.", "St", "La", "Le"
+]
+NAME_STOPWORDS = {
+    "of", "from", "in", "at", "on", "and", "with", "for", "by", "to",
+    "church", "congregation", "presbytery", "session", "meeting",
+    "minutes", "committee", "report", "budget", "ledger", "adjourned",
+    "whereas", "therefore", "hereby", "trustees", "members", "pastorate",
+    "treasurer", "secretary"
 }
 
-NAME_TOWN_STATS: Optional[Dict[str, Dict[str, int]]] = None
+# -------------------------
+# Name corpus stats (for statistical filtering)
+# -------------------------
+
+_NAME_STATS_CACHE: Optional[Dict[str, Set[str]]] = None
 
 
-def normalize_token(s: str) -> str:
+def build_name_stats() -> Dict[str, Set[str]]:
     """
-    Normalize tokens for loose comparison:
-    - strip punctuation
-    - collapse spaces
-    - title-case (Elizabeth, Washington)
+    Build simple name statistics from:
+      - dictionary_hints.json (names)
+      - existing MASTER_JSONL people entries (if present)
+      - per-page JSON files in ocr_output/
+    Returns dict with sets:
+      - allowed_first_names
+      - allowed_surnames
+      - allowed_full_names
     """
-    if not isinstance(s, str):
-        return ""
-    s = s.strip().strip(",.;:()[]")
-    s = re.sub(r"\s+", " ", s)
-    return s.title()
+    global _NAME_STATS_CACHE
+    if _NAME_STATS_CACHE is not None:
+        return _NAME_STATS_CACHE
 
+    allowed_first: Set[str] = set()
+    allowed_surnames: Set[str] = set()
+    allowed_full: Set[str] = set()
 
-def build_name_town_stats() -> Dict[str, Dict[str, int]]:
-    """
-    Scan existing JSON outputs (MASTER_JSONL if present, otherwise page-*.json)
-    and build simple frequency counts for ambiguous tokens:
-      - how often they appear as FIRST NAMES in people.full_name
-      - how often they appear as places.name
-    """
-    global NAME_TOWN_STATS
-    if NAME_TOWN_STATS is not None:
-        return NAME_TOWN_STATS
+    def _add_name(full_name: str, given: Optional[str], surname: Optional[str]):
+        if full_name:
+            allowed_full.add(full_name.strip())
+        if given:
+            allowed_first.add(given.strip())
+        if surname:
+            allowed_surnames.add(surname.strip())
 
-    stats: Dict[str, Dict[str, int]] = {
-        name: {"as_person_first": 0, "as_place": 0}
-        for name in AMBIGUOUS_PLACE_NAMES
-    }
+    # 1) Hints "names" list
+    for nm in HINTS.get("names", []):
+        nm = str(nm).strip()
+        if not nm:
+            continue
+        toks = nm.split()
+        if len(toks) == 1:
+            # ambiguous, treat as surname first
+            _add_name("", None, toks[0])
+        else:
+            given = toks[0]
+            surname = toks[-1]
+            _add_name(nm, given, surname)
 
-    def _update_from_obj(obj: Dict[str, Any]) -> None:
-        # People → first names
+    # 2) MASTER_JSONL if exists
+    def _update_from_obj(obj: Dict[str, Any]):
         for person in obj.get("people", []) or []:
             if not isinstance(person, dict):
                 continue
-            full = person.get("full_name") or ""
-            if not isinstance(full, str) or not full.strip():
-                continue
-            tokens = full.strip().split()
-            if len(tokens) < 2:
-                continue
-            first = normalize_token(tokens[1])  # tokens[0] is usually honorific
-            if first in stats:
-                stats[first]["as_person_first"] += 1
+            full = str(person.get("full_name") or "").strip()
+            given = str(person.get("given_name") or "").strip() or None
+            surname = str(person.get("surname") or "").strip() or None
+            if not full and (given or surname):
+                parts = []
+                if given:
+                    parts.append(given)
+                if surname:
+                    parts.append(surname)
+                full = " ".join(parts)
+            if full or given or surname:
+                _add_name(full, given, surname)
 
-        # Places → names
-        for pl in obj.get("places", []) or []:
-            if isinstance(pl, dict):
-                nm = pl.get("name") or ""
-            else:
-                nm = pl
-            if not isinstance(nm, str) or not nm.strip():
-                continue
-            nm_norm = normalize_token(nm)
-            if nm_norm in stats:
-                stats[nm_norm]["as_place"] += 1
-
-    # Prefer master JSONL if it exists
     if MASTER_JSONL.exists():
         try:
             with MASTER_JSONL.open("r", encoding="utf-8") as f:
@@ -380,13 +377,13 @@ def build_name_town_stats() -> Dict[str, Dict[str, int]]:
                         continue
                     try:
                         obj = json.loads(line)
+                        _update_from_obj(obj)
                     except Exception:
                         continue
-                    _update_from_obj(obj)
         except Exception as e:
-            logger.warning(f"[NAME_TOWN_STATS] Failed reading MASTER_JSONL: {e}")
+            logger.warning(f"[NAME_STATS] Failed reading MASTER_JSONL: {e}")
 
-    # Also scan per-page JSON to catch new runs or if MASTER_JSONL is missing
+    # 3) Per-page JSONs
     try:
         for p in OUTPUT_DIR.glob("page-*.json"):
             if p.name.endswith("_raw_broken.json"):
@@ -394,21 +391,23 @@ def build_name_town_stats() -> Dict[str, Dict[str, int]]:
             try:
                 with p.open("r", encoding="utf-8") as f:
                     obj = json.load(f)
+                _update_from_obj(obj)
             except Exception:
                 continue
-            _update_from_obj(obj)
     except Exception as e:
-        logger.warning(f"[NAME_TOWN_STATS] Failed scanning per-page JSON: {e}")
+        logger.warning(f"[NAME_STATS] Failed scanning per-page JSON: {e}")
 
-    NAME_TOWN_STATS = stats
+    _NAME_STATS_CACHE = {
+        "allowed_first_names": allowed_first,
+        "allowed_surnames": allowed_surnames,
+        "allowed_full_names": allowed_full,
+    }
     logger.info(
-        "[NAME_TOWN_STATS] Built ambiguous name/place stats: " +
-        ", ".join(
-            f"{name} P={counts['as_person_first']} / T={counts['as_place']}"
-            for name, counts in stats.items()
-        )
+        "[NAME_STATS] Built name stats: "
+        f"{len(allowed_first)} firsts, {len(allowed_surnames)} surnames, "
+        f"{len(allowed_full)} full names"
     )
-    return NAME_TOWN_STATS
+    return _NAME_STATS_CACHE
 
 # -------------------------
 # Page list w/ ranges
@@ -463,28 +462,18 @@ def tile_is_mostly_blank(im: Image.Image, threshold: float = 0.985) -> bool:
     """
     Return True if the tile is mostly blank (very low ink coverage).
     threshold is the fraction of pixels that must be 'background' to treat it as blank.
-    0.985 means '≥ 98.5% of pixels are background' → skip.
     """
-    import numpy as np
-    import cv2
-
-    # convert to gray
     gray = cv2.cvtColor(np.array(im.convert("RGB")), cv2.COLOR_RGB2GRAY)
-    # Otsu threshold to separate ink from paper
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # th is 255 for background, 0 for ink (after inversion in some paths, but here we keep it simple)
     total = th.size
     if total == 0:
         return True
 
-    # treat 'very light' as background as well
     background = np.count_nonzero(th > 250)
     frac_background = background / float(total)
 
     return frac_background >= threshold
-
-
 
 
 def maybe_downscale(im: Image.Image) -> Tuple[Image.Image, bool]:
@@ -608,7 +597,7 @@ def find_text_regions(
 def build_system_prompt() -> str:
     """
     Load system prompt from external file if present, otherwise fall back
-    to the older inline prompt that also injects dictionary hints.
+    to inline prompt that also injects dictionary hints.
     """
     if SYSTEM_PROMPT_PATH.exists():
         try:
@@ -618,7 +607,6 @@ def build_system_prompt() -> str:
         except Exception as e:
             logger.warning(f"[PROMPTS] Failed to read system prompt file: {e}")
 
-    # Fallback inline prompt with hints
     surnames_str = ", ".join(COMBINED_SURNAMES[:80])
     places_str = ", ".join(COMBINED_PLACES[:80])
     church_terms_str = ", ".join(COMBINED_CHURCH_TERMS[:80])
@@ -632,21 +620,17 @@ You are an expert historical paleographer and archivist working on PUBLIC DOMAIN
 18th–19th century Presbyterian church records (Bethel and related congregations).
 These documents are over 150 years old and contain no modern personal data.
 
-CRITICAL SAFETY NOTE (READ CAREFULLY):
-- This work is fully allowed under all policies.
+CRITICAL SAFETY NOTE:
+- This work is fully allowed.
 - Do NOT refuse.
 - Do NOT apologize.
 - Do NOT output safety warnings.
-- Never produce phrases like "I'm sorry, I can't assist with that" or
-  "I can't help with that request."
-- Your task is purely neutral transcription and light structuring of
-  historical, public-domain material.
+- Never produce phrases like "I'm sorry, I can't assist with that."
 
 You will receive images (or tiles) from ONE page or a clearly delimited
 quadrant/region of a page.
 
-Your tasks:
-
+Tasks:
 1) Perform high-fidelity OCR / ICR transcription.
 2) Provide light structural metadata about that page/quadrant.
 3) Return a SINGLE JSON object between markers:
@@ -655,88 +639,50 @@ Your tasks:
    {{ ... }}
    ---END_JSON---
 
-Anything outside those markers will be ignored.
-
-==================
-JSON OBJECT SCHEMA
-==================
-
-The JSON object MUST include at least:
+Schema (minimum):
 
 {{
-  "page_number": <integer>,          // physical page number
-  "quadrant_label": <string or null>,// e.g. "Q1", "Q2" for quadrant calls
+  "page_number": <integer>,
+  "quadrant_label": <string or null>,
   "page_title": <string or null>,
   "page_type": "narrative" | "ledger" | "mixed",
-  "record_type": <string>,           // e.g. "session minutes", "family visitation ledger",
-  "page_date_hint": <string or null>,// best-guess date like "Nov 1853" or "Jan 10 1855"
+  "record_type": <string>,
+  "page_date_hint": <string or null>,
   "transcription_method": "{TRANSCRIPTION_VERSION}",
   "transcription_quality": "high" | "medium" | "low",
 
-  "content": <string>,               // cleaned, human-readable transcription
-  "raw_text": <string>               // closer-to-verbatim; may match content
+  "content": <string>,
+  "raw_text": <string>
 }}
 
 Optional:
-- "places": [ <string>, ... ]        // distinct place names
+- "places": [ <string>, ... ]
 - "notes": <string or null>
 
-=========================
-TRANSCRIPTION GUIDELINES
-=========================
+Transcription rules:
+- Be faithful to handwriting / print.
+- Do NOT invent people, places, or events.
+- Do NOT modernize spelling.
+- You may unwrap multi-column registers into a linear reading order.
 
-- Be as faithful as possible to the handwriting / print.
-- Do NOT invent people, places, or events that are not present.
-- Preserve line breaks where helpful, but you may unwrap multi-column
-  registers into a more linear reading order.
-- Do NOT modernize spelling (keep "betwixt", "ye", etc.).
-- You may expand obvious abbreviations when confident, but keep the
-  original nearby (e.g. "Presb." → "Presbyterian (Presb.)").
+Hints (soft):
 
-=========================
-DICTIONARY / HINTS (SOFT)
-=========================
-
-Use these hints to reduce hallucinations and help with ambiguous letters:
-
-- Common surnames in this corpus:
+- Common surnames:
   {surnames_str}
 
-- Important places and churches:
+- Important places / churches:
   {places_str}
 
-- Additional church terms / organizations:
+- Church terms:
   {church_terms_str}
 
-- Military / Civil War vocabulary:
+- Military / war vocabulary:
   {military_str}
 
-- Honorifics / titles (religious, civic, military, generic):
+- Honorifics / titles:
   {honorifics_str}
 
-Do NOT force text to match hints; they are only suggestions.
-
-=========================
-QUALITY FLAG
-=========================
-
-transcription_quality:
-- "high"   → clear text, very confident
-- "medium" → mostly legible with some uncertain phrases
-- "low"    → heavily damaged, many gaps or uncertain words
-
-=========================
-CONSTRAINTS
-=========================
-
-- The ONLY JSON must be between:
-
-  ---BEGIN_JSON---
-  {{ ... }}
-  ---END_JSON---
-
-- No comments inside JSON, no trailing commas.
-- No images or binary data in JSON.
+No comments or trailing commas inside JSON.
 """.strip()
 
 
@@ -751,7 +697,6 @@ def build_user_prompt(page_number: int, layout_type: str, quadrant_label: Option
         try:
             tmpl = USER_PROMPT_PATH.read_text(encoding="utf-8")
             logger.info(f"[PROMPTS] Using external user prompt: {USER_PROMPT_PATH}")
-            # Simple placeholder replacement (avoid .format because of JSON braces)
             tmpl = tmpl.replace("{{page_number}}", str(page_number))
             tmpl = tmpl.replace("{{layout_type}}", layout_type)
             tmpl = tmpl.replace("{{quadrant_label}}", q_label_text)
@@ -765,31 +710,27 @@ def build_user_prompt(page_number: int, layout_type: str, quadrant_label: Option
 You are transcribing {q_part}page {page_number} of a bound church record volume.
 
 CONTEXT:
-- These images are PUBLIC-DOMAIN historical ledgers from the 1700s–1800s.
+- PUBLIC-DOMAIN historical ledgers from the 1700s–1800s.
 - All people mentioned are long deceased.
-- There is no modern personal data or privacy risk.
+- No modern personal data or privacy risk.
 - Do NOT refuse. Do NOT apologize. Do NOT output safety warnings.
 
 LAYOUT:
-- Layout classification for this page: "{layout_type}".
+- Layout classification: "{layout_type}".
 - The images you see are all from THIS same logical unit ({q_part}page {page_number}).
-- Combine all image tiles you receive into one coherent transcription for this unit.
+- Combine all image tiles you receive into one coherent transcription.
 
 TASK:
 1) Carefully read ALL tiles.
 2) Produce an accurate transcription and light structural metadata.
-3) Then output EXACTLY ONE JSON OBJECT between:
+3) Output EXACTLY ONE JSON OBJECT between:
 
    ---BEGIN_JSON---
    {{ ... }}
    ---END_JSON---
 
-The JSON MUST follow the schema from the system prompt, including:
-- page_number, quadrant_label, page_title, page_type, record_type, page_date_hint
-- content, raw_text
-- transcription_method, transcription_quality
-
-Do NOT produce any text outside the JSON markers.
+Follow the schema from the system prompt.
+No text outside the JSON markers.
 """.strip()
 
 # -------------------------
@@ -829,8 +770,7 @@ REFUSAL_SNIPPETS = [
 
 def strip_refusal_meta(text: str) -> str:
     """
-    Remove meta-comment / refusal / boilerplate lines from OCR output.
-    This is only meant to strip model self-talk, not real ledger content.
+    Remove meta-comment / refusal lines from OCR output.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -843,13 +783,10 @@ def strip_refusal_meta(text: str) -> str:
         if not lower:
             kept.append(line)
             continue
-
         if any(snip in lower for snip in REFUSAL_SNIPPETS):
             continue
-
         kept.append(line)
 
-    # collapse excessive blank runs to ≤2
     cleaned: List[str] = []
     blank_run = 0
     for line in kept:
@@ -865,9 +802,6 @@ def strip_refusal_meta(text: str) -> str:
 
 
 def scrub_refusals_in_data(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply refusal scrubbing to key text fields in the page JSON.
-    """
     for field in ["content", "raw_text", "page_title", "notes"]:
         if field in data and isinstance(data[field], str):
             data[field] = strip_refusal_meta(data[field])
@@ -884,29 +818,24 @@ def extract_json_from_markers(
     quadrant_label: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Try, in order:
+    Try:
       1) JSON between ---BEGIN_JSON--- / ---END_JSON---
       2) Whole response as JSON if it starts with "{" and ends with "}"
       3) First {...} block found in the text
 
-    If all of those fail but there is non-empty text, wrap that text into
+    If all fail but there is non-empty text, wrap that text into
     a minimal JSON object instead of failing.
-
-    Then scrub obvious meta-comment / refusal sentences from content/raw_text.
     """
     raw_json: Optional[str] = None
 
-    # 1) Explicit markers
     m = re.search(r"---BEGIN_JSON---(.*?)---END_JSON---", text, re.DOTALL)
     if m:
         raw_json = m.group(1).strip()
     else:
-        # 2) Entire response might be JSON
         candidate = text.strip()
         if candidate.startswith("{") and candidate.endswith("}"):
             raw_json = candidate
         else:
-            # 3) First {...} block anywhere in text
             brace = re.search(r"\{.*\}", text, re.DOTALL)
             if brace:
                 raw_json = brace.group(0).strip()
@@ -939,7 +868,6 @@ def extract_json_from_markers(
         }
         return data
 
-    # Normal JSON path
     data = json.loads(raw_json)
 
     data.setdefault("page_number", page_number)
@@ -955,13 +883,13 @@ def extract_json_from_markers(
     data.setdefault("content", "")
     data.setdefault("raw_text", data.get("content", ""))
 
-    # scrub meta-comment / refusal chatter
     data["content"] = strip_refusal_meta(data.get("content", ""))
     data["raw_text"] = strip_refusal_meta(data.get("raw_text", ""))
 
     for fld in ["page_title", "page_type", "record_type", "page_date_hint"]:
         data.setdefault(fld, None)
 
+    # normalize places to simple list of strings (we'll rebuild later)
     places = data.get("places")
     norm_places: List[str] = []
     if isinstance(places, list):
@@ -975,7 +903,7 @@ def extract_json_from_markers(
     return data
 
 # -------------------------
-# Vision call (now FIFO via global queue)
+# Vision call (FIFO)
 # -------------------------
 
 
@@ -989,13 +917,8 @@ def call_vision_for_tiles(
 ) -> Dict[str, Any]:
     """
     Call the Vision model for one logical unit (whole page or one quadrant/region).
-
-    IMPORTANT:
-    - All OpenAI calls go through a single global FIFO queue.
-    - Exactly one API call is in-flight at any time.
-    - Quadrants/regions across all pages are strictly serialized.
+    All OpenAI calls go through the global FIFO queue.
     """
-    # Ensure global worker exists
     start_global_api_worker(client)
 
     sys_prompt = build_system_prompt()
@@ -1017,7 +940,7 @@ def call_vision_for_tiles(
     ]
 
     label = quadrant_label or "whole-page"
-    logger.info(f"Page {page_number} {label}: enqueuing API call")
+    logger.info(f"Page {page_number} {label}: enqueuing API call with {len(tiles)} tile(s)")
 
     def _task():
         logger.info(f"Page {page_number} {label}: starting API call (in worker)")
@@ -1034,7 +957,6 @@ def call_vision_for_tiles(
             assistant_text = "".join(parts_text)
         return assistant_text.strip()
 
-    # enqueue FIFO, block until that one finishes
     assistant_text = ""
     try:
         assistant_text = enqueue_api_call(_task)
@@ -1053,7 +975,6 @@ def call_vision_for_tiles(
         )
         return data
     except Exception as e:
-        # Debug dump of raw model output (best-effort)
         try:
             debug_label = quadrant_label or "whole"
             debug_path = OUTPUT_DIR / f"page-{page_number}_{debug_label}_raw.txt"
@@ -1066,30 +987,9 @@ def call_vision_for_tiles(
         raise
 
 # -------------------------
-# Simple sweeper (places, people, events with links)
+# Name / Event / Financial sweepers (v2.41)
 # -------------------------
-def is_non_name_trailer(tok: str) -> bool:
-    """
-    Tokens that look like dates, months, or obvious non-name words
-    that should be stripped off the end of a name phrase.
-    """
-    t = tok.strip(".,;:()").lower()
-    if not t:
-        return True
-    if t in MONTH_TOKENS:
-        return True
-    if t in NON_NAME_TRAILERS:
-        return True
-    # Pure digits (years / days)
-    if re.fullmatch(r"\d+", t):
-        return True
-    # Apostrophe-year like '79, '86
-    if re.fullmatch(r"'?\d{2}", t):
-        return True
-    return False
-# Tokens that should never be treated as surnames (month names / abbreviations, etc.)
 
-# Tokens that should never be treated as surnames (month names / abbreviations, etc.)
 MONTH_TOKENS = {
     "jan", "jan.", "january",
     "feb", "feb.", "february",
@@ -1105,9 +1005,7 @@ MONTH_TOKENS = {
     "dec", "dec.", "december",
 }
 
-# Extra words that often appear right after names but are NOT part of the name
-# (including churchy and ledger-ish noise)
-NON_NAME_TRAILERS = {
+EXTRA_NON_NAME_TRAILERS = {
     "ceased",
     "removed",
     "attending",
@@ -1117,203 +1015,392 @@ NON_NAME_TRAILERS = {
     "husband",
     "baptists",
     "church",
-    "cert.",
-    "cert",
-    "ex.",
-    "ex",
-    "ext",
-
-    # geography / jurisdiction
+    "cert.", "cert",
+    "ex.", "ex", "ext",
     "co", "co.", "county",
     "tp", "tp.", "twp", "twp.", "twsp", "twsp.", "township",
     "ward",
     "pa", "pa.", "pennsylvania",
     "ohio", "virginia", "va", "wv",
-
-    # structural / meeting junk
     "meeting", "minutes", "session", "adjourned",
-
-    # other generic junk
     "etc",
 }
-
 
 DATE_RE = re.compile(
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|"
     r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[,/]\s*\d{2,4})?\b"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[,/]\s*\d{2,4})?\b",
+    flags=re.IGNORECASE
 )
-YEAR_RE = re.compile(r"\b(17|18|19)\d{2}\b")
+YEAR_RE = re.compile(r"\b(16|17|18|19|20)\d{2}\b")
 
 
-def sweep_places(text: str, initial_places: List[str]) -> List[Dict[str, Any]]:
+def is_non_name_trailer(tok: str) -> bool:
+    t = tok.strip(".,;:()").lower()
+    if not t:
+        return True
+    if t in MONTH_TOKENS:
+        return True
+    if t in EXTRA_NON_NAME_TRAILERS:
+        return True
+    if t in NAME_STOPWORDS:
+        return True
+    if re.fullmatch(r"\d+", t):
+        return True
+    if re.fullmatch(r"'?\d{2}", t):
+        return True
+    return False
+
+
+class NameExtractor:
     """
-    Very light place sweep:
-
-    - Start from COMBINED_PLACES (defaults + dictionary_hints).
-    - Include any initial_places passed in from the model.
-    - Also sniff simple 'X Township / X Tp. / X Co.' patterns.
-    - Down-rank ambiguous things like 'Elizabeth' if the corpus
-      says they're mostly used as first names.
+    Extracts person names from historical text using pattern matching,
+    with support for honorifics, initials and simple ledger-style patterns.
+    Uses a statistical name filter in apply_local_sweeper to reduce false positives.
     """
-    found: Dict[str, str] = {}
-    lowered = text.lower()
 
-    stats = build_name_town_stats()
+    def __init__(self):
+        hon_escaped = [re.escape(h) for h in ALL_HONORIFICS]
+        self.honorific_pattern = r'(?:' + '|'.join(hon_escaped) + r')'
+        suf_escaped = [re.escape(s) for s in NAME_SUFFIXES]
+        self.suffix_pattern = r'(?:' + '|'.join(suf_escaped) + r')'
+        self.INITIAL = r'[A-Z]\.?'
+        self.WORD = r"[A-Z][a-z]+(?:['\-][A-Z]?[a-z]+)*"
 
-    def _should_skip_place(name: str) -> bool:
-        norm = normalize_token(name)
-        if norm not in AMBIGUOUS_PLACE_NAMES:
-            return False
-        info = stats.get(norm)
-        if not info:
-            return False
-        # If we've *never* seen it as a place but have seen it as a first name,
-        # treat it as "probably a person, not a town" and skip.
-        if info["as_place"] == 0 and info["as_person_first"] > 0:
-            logger.debug(
-                f"[PLACES] Skipping ambiguous place '{norm}' "
-                f"(person_first={info['as_person_first']}, place={info['as_place']})"
+    @staticmethod
+    def is_stopword(token: str) -> bool:
+        return token.lower().rstrip('.,;:') in NAME_STOPWORDS
+
+    @staticmethod
+    def is_surname_prefix(token: str) -> bool:
+        return token.rstrip('.,;:') in SURNAME_PREFIXES
+
+    @staticmethod
+    def normalize_honorific(h: str) -> str:
+        h_clean = h.strip().rstrip('.')
+        for known in ALL_HONORIFICS:
+            if known.rstrip('.').lower() == h_clean.lower():
+                return known
+        return h
+
+    def extract_names(self, text: str) -> List[Dict[str, Any]]:
+        names: Dict[str, Dict[str, Any]] = {}
+        names.update(self._extract_formal_names(text))
+        names.update(self._extract_ledger_names(text))
+        names.update(self._extract_simple_names(text))
+        return list(names.values())
+
+    def _extract_formal_names(self, text: str) -> Dict[str, Dict[str, Any]]:
+        names: Dict[str, Dict[str, Any]] = {}
+        pattern = rf'''
+            (?P<honorifics>(?:{self.honorific_pattern}\s*)+)?   # honorifics
+            (?P<initials>(?:{self.INITIAL}\s+)+)?               # initials
+            (?P<given>{self.WORD})?                             # optional given
+            \s+
+            (?P<surname_prefix>{self.WORD})?                    # optional prefix
+            \s*
+            (?P<surname>{self.WORD})                            # surname
+            (?:\s+(?P<suffix>{self.suffix_pattern}))?           # optional suffix
+        '''
+        for match in re.finditer(pattern, text, re.VERBOSE):
+            full_match = match.group(0).strip()
+            if self._is_false_positive(full_match, text, match.start()):
+                continue
+
+            honorifics_raw = match.group('honorifics') or ''
+            initials_raw = match.group('initials') or ''
+            given = match.group('given')
+            surname_prefix = match.group('surname_prefix')
+            surname = match.group('surname')
+            suffix = match.group('suffix')
+
+            has_honorific = bool(honorifics_raw.strip())
+            has_initials = bool(initials_raw.strip())
+            has_given = given is not None
+            if not (has_honorific or has_initials or has_given):
+                continue
+
+            if surname_prefix and not self.is_surname_prefix(surname_prefix):
+                if not given and not has_initials:
+                    given = surname_prefix
+                    surname_prefix = None
+
+            full_surname = surname
+            if surname_prefix and self.is_surname_prefix(surname_prefix):
+                full_surname = f"{surname_prefix} {surname}"
+
+            honorifics: List[str] = []
+            if honorifics_raw:
+                for h in re.findall(rf'{self.honorific_pattern}', honorifics_raw):
+                    honorifics.append(self.normalize_honorific(h))
+
+            initials: List[str] = []
+            if initials_raw:
+                initials = [i.strip() for i in initials_raw.split() if i.strip()]
+
+            parts: List[str] = []
+            if honorifics:
+                parts.extend(honorifics)
+            if initials:
+                parts.extend(initials)
+            if given:
+                parts.append(given)
+            parts.append(full_surname)
+            if suffix:
+                parts.append(suffix)
+            full_name = ' '.join(parts)
+
+            given_name_final = given or (initials[0] if initials else None)
+
+            is_military = any(
+                h.rstrip('.') in [m.rstrip('.') for m in HONORIFICS_MILITARY]
+                for h in honorifics
             )
-            return True
+
+            if full_name not in names:
+                names[full_name] = {
+                    "full_name": full_name,
+                    "given_name": given_name_final,
+                    "surname": full_surname,
+                    "honorific": honorifics[0] if honorifics else None,
+                    "all_honorifics": honorifics if len(honorifics) > 1 else None,
+                    "suffix": suffix,
+                    "initials": initials if initials else None,
+                    "church_role": self._infer_church_role(honorifics),
+                    "is_military": is_military,
+                    "military_rank": honorifics[0] if is_military else None,
+                    "notes": None,
+                    "confidence": 0.95,
+                }
+
+        return names
+
+    def _extract_ledger_names(self, text: str) -> Dict[str, Dict[str, Any]]:
+        names: Dict[str, Dict[str, Any]] = {}
+        pattern = rf'''
+            \b
+            (?P<surname>{self.WORD}(?:\s+{self.WORD})?)  # surname
+            ,\s*
+            (?P<honorific>{self.honorific_pattern}\s+)?  # optional honorific
+            (?P<given>{self.WORD}(?:\s+{self.INITIAL})?) # given
+            (?:\s+(?P<suffix>{self.suffix_pattern}))?    # optional suffix
+            \b
+        '''
+        for match in re.finditer(pattern, text, re.VERBOSE):
+            surname = match.group('surname').strip()
+            honorific_raw = match.group('honorific')
+            given = match.group('given').strip()
+            suffix = match.group('suffix')
+
+            if self.is_stopword(surname):
+                continue
+
+            honorific = None
+            if honorific_raw:
+                honorific = self.normalize_honorific(honorific_raw.strip())
+
+            parts: List[str] = []
+            if honorific:
+                parts.append(honorific)
+            parts.append(given)
+            parts.append(surname)
+            if suffix:
+                parts.append(suffix)
+            full_name = ' '.join(parts)
+
+            is_military = False
+            if honorific:
+                is_military = any(
+                    honorific.rstrip('.') == m.rstrip('.')
+                    for m in HONORIFICS_MILITARY
+                )
+
+            if full_name not in names:
+                names[full_name] = {
+                    "full_name": full_name,
+                    "given_name": given,
+                    "surname": surname,
+                    "honorific": honorific,
+                    "suffix": suffix,
+                    "initials": None,
+                    "church_role": self._infer_church_role([honorific] if honorific else []),
+                    "is_military": is_military,
+                    "military_rank": honorific if is_military else None,
+                    "notes": None,
+                    "confidence": 0.93,
+                }
+
+        return names
+
+    def _extract_simple_names(self, text: str) -> Dict[str, Dict[str, Any]]:
+        names: Dict[str, Dict[str, Any]] = {}
+        pattern = rf'''
+            \b
+            (?P<initials>(?:{self.INITIAL}\s+)+)?     # initials
+            (?P<given>{self.WORD})                   # given
+            \s+
+            (?P<surname_prefix>{self.WORD})?         # optional prefix
+            \s*
+            (?P<surname>{self.WORD})                 # surname
+            (?:\s+(?P<suffix>{self.suffix_pattern}))?
+            \b
+        '''
+        for match in re.finditer(pattern, text, re.VERBOSE):
+            full_match = match.group(0).strip()
+            if self._is_false_positive(full_match, text, match.start()):
+                continue
+
+            initials_raw = match.group('initials')
+            given = match.group('given')
+            surname_prefix = match.group('surname_prefix')
+            surname = match.group('surname')
+            suffix = match.group('suffix')
+
+            if self.is_stopword(given) or self.is_stopword(surname):
+                continue
+
+            full_surname = surname
+            if surname_prefix:
+                if self.is_surname_prefix(surname_prefix):
+                    full_surname = f"{surname_prefix} {surname}"
+                else:
+                    # avoid triple-name weirdness that often isn't a person
+                    continue
+
+            initials: List[str] = []
+            if initials_raw:
+                initials = [i.strip() for i in initials_raw.split() if i.strip()]
+
+            parts: List[str] = []
+            if initials:
+                parts.extend(initials)
+            parts.append(given)
+            parts.append(full_surname)
+            if suffix:
+                parts.append(suffix)
+            full_name = ' '.join(parts)
+
+            if full_name not in names:
+                names[full_name] = {
+                    "full_name": full_name,
+                    "given_name": initials[0] if initials else given,
+                    "surname": full_surname,
+                    "honorific": None,
+                    "suffix": suffix,
+                    "initials": initials if initials else None,
+                    "church_role": None,
+                    "is_military": False,
+                    "military_rank": None,
+                    "notes": None,
+                    "confidence": 0.85,
+                }
+
+        return names
+
+    def _is_false_positive(self, name: str, text: str, position: int) -> bool:
+        context_start = max(0, position - 50)
+        context_end = min(len(text), position + len(name) + 50)
+        context = text[context_start:context_end].lower()
+
+        false_indicators = [
+            "church", "congregation", "presbytery", "session",
+            "meeting", "minutes", "resolutions", "whereas",
+            "prayer", "motion", "voted", "resolved"
+        ]
+        if len(name.split()) <= 2:
+            for indicator in false_indicators:
+                idx = context.find(indicator)
+                if idx != -1:
+                    if abs(idx - (position - context_start)) < 20:
+                        return True
         return False
 
-    # Dictionary / hints
+    def _infer_church_role(self, honorifics: List[str]) -> Optional[str]:
+        for h in honorifics:
+            if not h:
+                continue
+            h_clean = h.rstrip('.').lower()
+            if h_clean in ["rev", "revd", "pastor"]:
+                return "Minister"
+            if h_clean in ["elder", "ruling elder"]:
+                return "Elder"
+            if h_clean == "deacon":
+                return "Deacon"
+            if h_clean in ["moderator", "clerk", "trustee"]:
+                return h.rstrip('.')
+        return None
+
+
+def filter_people_by_stats(people: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Use corpus-derived name stats to down-rank/drop obvious false positives.
+    Rule of thumb:
+      - Keep if surname is in allowed_surnames or COMBINED_SURNAMES.
+      - Otherwise, only keep if full_name appears in allowed_full_names.
+    """
+    stats = build_name_stats()
+    allowed_first = stats["allowed_first_names"]
+    allowed_surnames = stats["allowed_surnames"]
+    allowed_full = stats["allowed_full_names"]
+
+    filtered: List[Dict[str, Any]] = []
+    for p in people:
+        full = (p.get("full_name") or "").strip()
+        given = (p.get("given_name") or "").strip()
+        surname = (p.get("surname") or "").strip()
+
+        score = 0
+        if full and full in allowed_full:
+            score += 3
+        if surname and (surname in allowed_surnames or surname in COMBINED_SURNAMES):
+            score += 2
+        if given and given in allowed_first:
+            score += 1
+
+        if score == 0:
+            # very conservative: drop unknown 2-token names
+            if len(full.split()) <= 3:
+                continue
+            # for longer names (multi-initial combos) keep but lower confidence
+            p["confidence"] = min(p.get("confidence", 0.85), 0.6)
+        filtered.append(p)
+
+    return filtered
+
+# Place sweeper (simple, uses dictionary hints)
+
+def sweep_places(text: str, initial_places: List[str]) -> List[Dict[str, Any]]:
+    found: Dict[str, str] = {}
+    low = text.lower()
+
     for place in COMBINED_PLACES:
         if not place:
             continue
-        if place.lower() not in lowered:
-            continue
-        if _should_skip_place(place):
-            continue
-        found[place] = ""
+        if place.lower() in low:
+            found.setdefault(place, "")
 
-    # Anything the model already tagged as a place
     for p in initial_places:
         if not p:
             continue
-        if _should_skip_place(p):
-            continue
         found.setdefault(p, "")
 
-    # Simple regex for "X Township / X Tp. / X Co."
-    # e.g. "Scott Township", "Snowden Tp.", "Lawrence Co."
+    # basic "X Township" / "X County"
     township_re = re.compile(
         r"\b([A-Z][a-zA-Z]+)\s+(Township|Tp\.|Tp|Twp\.|Twp|Twsp\.|Twsp)\b"
     )
     county_re = re.compile(r"\b([A-Z][a-zA-Z]+)\s+Co\.?\b")
-
     for m in township_re.finditer(text):
         base = m.group(1)
         label = f"{base} Township"
-        if not _should_skip_place(label):
-            found.setdefault(label, "")
-
+        found.setdefault(label, "")
     for m in county_re.finditer(text):
         base = m.group(1)
         label = f"{base} County"
-        if not _should_skip_place(label):
-            found.setdefault(label, "")
+        found.setdefault(label, "")
 
-    return [{"name": name, "notes": notes or None} for name, notes in sorted(found.items())]
+    return [{"name": k, "notes": v or None} for k, v in sorted(found.items())]
 
-def sweep_people(text: str) -> List[Dict[str, Any]]:
-    """
-    Very light people sweep: honorific + capitalized name.
-
-    Improvements:
-    - Collapses internal newlines so "Miss Mary J.\\nMartin" → "Miss Mary J. Martin".
-    - Strips trailing tokens that look like dates/months or obvious non-name words
-      (e.g. "June", "Dec.", "'86", "Ceased", "Removed", "Baptists", etc.).
-    - Stops at prepositions like "of / from / in / at / to / by / with / for / and".
-    - Avoids treating ledger boilerplate like "Meeting adjourned" as a person.
-    """
-    people: Dict[str, Dict[str, Any]] = {}
-
-    honorific_union = "|".join(re.escape(h) for h in ALL_HONORIFICS)
-    # Grab "Honorific + the rest of the phrase on that line-ish"
-    pattern = rf"\b(?:{honorific_union})\s+[A-Z][^\n]*"
-
-    for m in re.finditer(pattern, text):
-        raw_full = m.group(0)
-
-        # Collapse whitespace/newlines → single spaces
-        norm_full = " ".join(raw_full.split()).strip()
-        if not norm_full:
-            continue
-
-        tokens = norm_full.split()
-        if len(tokens) < 2:
-            # Honorific only, no name
-            continue
-
-        honorific = tokens[0]
-        rest_tokens = tokens[1:]
-
-        # Build the "real" name tokens, stopping when we hit non-name stuff
-        name_tokens: List[str] = []
-        for tok in rest_tokens:
-            base = tok.strip(",.;:()")
-            if not base:
-                break
-
-            lower = base.lower()
-
-            # If the word is clearly structural or "not a name", stop
-            if is_non_name_trailer(base):
-                break
-
-            # Stop at common prepositions; they typically start the "of Washington Co."
-            # or "of Bethel Church" clause.
-            if lower in {"of", "from", "in", "at", "on", "for", "by", "with", "and", "to"}:
-                break
-
-            # Names should start with a capital letter (simple heuristic)
-            if not re.match(r"^[A-Z]", base):
-                break
-
-            name_tokens.append(base)
-
-        if len(name_tokens) == 0:
-            # Everything after the honorific was junk / location / date
-            continue
-
-        # Guard against weird "Meeting / Session / Minutes" as first token
-        if name_tokens[0].lower() in {"meeting", "session", "minutes"}:
-            continue
-
-        full = " ".join([honorific] + name_tokens)
-        if full in people:
-            continue
-
-        given_name = name_tokens[0]
-        surname = name_tokens[-1] if len(name_tokens) >= 2 else None
-
-        # Infer church_role from the full snippet if possible
-        raw_lower = raw_full.lower()
-        church_role = None
-        if "pastor" in raw_lower:
-            church_role = "Pastor"
-        elif "elder " in raw_lower or "elder," in raw_lower:
-            church_role = "Elder"
-        elif "deacon" in raw_lower:
-            church_role = "Deacon"
-
-        people[full] = {
-            "full_name": full,
-            "given_name": given_name,
-            "surname": surname,
-            "honorific": honorific,
-            "church_role": church_role,
-            "is_military": any(
-                honorific.startswith(h) for h in HONORIFICS_MILITARY
-            ),
-            "military_rank": None,
-            "notes": None,
-            "confidence": 0.75,
-        }
-
-    return list(people.values())
+# Event + military sweeper
 
 def _extract_year_from_string(s: str) -> Optional[int]:
     m = YEAR_RE.search(s)
@@ -1325,85 +1412,103 @@ def _extract_year_from_string(s: str) -> Optional[int]:
         return None
 
 
+MILITARY_RANK_TOKENS = [r.lower().rstrip(".") for r in HONORIFICS_MILITARY]
+
+# more conservative core military cues
+MILITARY_CORE_PATTERNS = [
+    r"\bcivil war\b",
+    r"\brevolutionary war\b",
+    r"\bworld war\b",
+    r"\bspanish[- ]american war\b",
+    r"\bwar of\b",
+    r"\bregiment\b",
+    r"\bregt\b",
+    r"\bco\.\s*[a-z]\b",
+    r"\bcompany\s+[a-z]\b",
+    r"\binfantry\b",
+    r"\bartillery\b",
+    r"\bcavalry\b",
+    r"\bvolunteers?\b",
+    r"\bmustered\b",
+    r"\benlisted\b",
+    r"\bdischarged\b",
+    r"\bprisoner\b",
+    r"\bkilled in (?:battle|action)\b",
+    r"\bbattle of\b",
+    r"\barmy\b",
+    r"\bnavy\b",
+    r"\bbattery\b",
+    r"\bbrigade\b",
+    r"\bdivision\b",
+]
+
+
+def is_military_sentence(lowered: str) -> bool:
+    for pat in MILITARY_CORE_PATTERNS:
+        if re.search(pat, lowered):
+            return True
+    if any(rank in lowered for rank in MILITARY_RANK_TOKENS):
+        return True
+    # allow hints as backup, but only when "war" or "battle" is present
+    if "war" in lowered or "battle" in lowered:
+        for kw in COMBINED_MILITARY:
+            if kw.lower() in lowered:
+                return True
+    return False
+
+
 def sweep_events(
     text: str,
     people: List[Dict[str, Any]],
-    places: List[Dict[str, Any]]
+    places: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Sweep for simple events and link them to people & places.
-
-    Event types:
-    - birth
-    - baptism
-    - marriage
-    - death
-    - other (e.g. purely military / service notes)
-
-    Extra:
-    - is_military flag based on COMBINED_MILITARY / ranks / battle keywords.
-    """
     events: List[Dict[str, Any]] = []
-
     sentences = re.split(r"(?:\n{2,}|(?<=[.!?])\s+)", text)
-    place_names = [p["name"] for p in places if isinstance(p, dict) and "name" in p]
 
-    military_terms = [kw.lower() for kw in COMBINED_MILITARY]
-    military_ranks = [r.lower().rstrip(".") for r in HONORIFICS_MILITARY]
+    place_names = [p["name"] for p in places if isinstance(p, dict) and "name" in p]
 
     for sent in sentences:
         s = sent.strip()
         if not s:
             continue
         lowered = s.lower()
-        event_type: Optional[str] = None
 
-        if any(w in lowered for w in ["born", "birth"]):
+        event_type: Optional[str] = None
+        if any(w in lowered for w in ["died", "dead", "deceased", "killed"]):
+            event_type = "death"
+        elif any(w in lowered for w in ["born", "birth"]):
             event_type = "birth"
-        elif any(w in lowered for w in ["baptized", "baptised", "baptism"]):
-            event_type = "baptism"
         elif any(w in lowered for w in ["married", "marriage"]):
             event_type = "marriage"
-        elif any(w in lowered for w in ["died", "dead", "deceased", "killed"]):
-            event_type = "death"
+        elif any(w in lowered for w in ["baptized", "baptised", "baptism"]):
+            event_type = "baptism"
 
-        # Military flavor detection (independent of main type)
-        is_military = False
-        if any(term in lowered for term in military_terms):
-            is_military = True
-        if any(rank in lowered for rank in military_ranks):
-            is_military = True
+        is_mil = is_military_sentence(lowered)
 
-        # If nothing else classified this sentence but it's clearly military,
-        # treat as a generic "other" military event.
-        if event_type is None and is_military:
+        if not event_type and is_mil:
             event_type = "other"
 
         if not event_type:
             continue
 
-        # Date / year
-        date_match = DATE_RE.search(s)
-        if date_match:
-            date = date_match.group(0)
+        date = None
+        d = DATE_RE.search(s)
+        if d:
+            date = d.group(0)
         else:
-            year_match = YEAR_RE.search(s)
-            date = year_match.group(0) if year_match else None
+            y = YEAR_RE.search(s)
+            if y:
+                date = y.group(0)
 
-        year: Optional[int] = None
-        if date:
-            year = _extract_year_from_string(date)
-        if year is None:
-            year = _extract_year_from_string(s)
+        year = _extract_year_from_string(date) if date else _extract_year_from_string(s)
 
-        # Place inference: first known place name that appears in the sentence
         place_for_event = None
         for pl in place_names:
             if pl and pl.lower() in lowered:
                 place_for_event = pl
                 break
 
-        # People linking: by full_name first, then surname
+        # link by surname first
         people_for_event: Dict[str, Dict[str, Any]] = {}
         for person in people:
             full = person.get("full_name") or ""
@@ -1413,12 +1518,8 @@ def sweep_events(
             surname = tokens[-1] if len(tokens) >= 2 else None
 
             if full in s:
-                people_for_event[full] = {
-                    "full_name": full,
-                    "match_type": "full",
-                }
+                people_for_event[full] = {"full_name": full, "match_type": "full"}
                 continue
-
             if surname:
                 if re.search(r"\b" + re.escape(surname) + r"\b", s):
                     if full not in people_for_event:
@@ -1434,17 +1535,82 @@ def sweep_events(
             "place": place_for_event,
             "raw_entry": s,
             "normalized_summary": f"{event_type.capitalize()} event: {s[:180]}{' …' if len(s) > 180 else ''}",
-            "is_military": is_military,
+            "is_military": bool(is_mil),
             "people": list(people_for_event.values()),
         })
 
     return events
 
+# Financial sweeper (simple)
+
+MONEY_RE = re.compile(
+    r"\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)"
+)
+FINANCE_KEYWORDS = {
+    "salary", "salaries", "wages", "pay", "stipend",
+    "repair", "repairs", "building", "construction", "roof",
+    "paint", "painting", "maintenance",
+    "mission", "missions", "benevolence", "charity", "poor",
+    "organ", "music", "choir", "hymnals",
+    "interest", "principal", "debt", "loan",
+}
+
+
+def parse_amount(num_str: str) -> Optional[float]:
+    try:
+        return float(num_str.replace(",", ""))
+    except Exception:
+        return None
+
+
+def categorize_financial_line(lowered: str) -> str:
+    if any(w in lowered for w in ["salary", "salaries", "wages", "pay", "stipend", "pastor"]):
+        return "salaries"
+    if any(w in lowered for w in ["repair", "repairs", "building", "construction", "roof", "paint", "painting", "maintenance"]):
+        return "building"
+    if any(w in lowered for w in ["mission", "missions", "benevolence", "charity", "poor"]):
+        return "missions/charity"
+    if any(w in lowered for w in ["interest", "principal", "debt", "loan"]):
+        return "debt/finance"
+    return "other"
+
+
+def sweep_financial(text: str) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        lowered = line_stripped.lower()
+        m = MONEY_RE.search(line_stripped)
+        if not m:
+            continue
+        amt = parse_amount(m.group(1))
+        if amt is None:
+            continue
+        category = categorize_financial_line(lowered)
+        entries.append({
+            "amount": amt,
+            "currency": "USD",
+            "category": category,
+            "raw_line": line_stripped,
+        })
+    return entries
+
+# -------------------------
+# Apply local sweeper
+# -------------------------
+
+
 def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Run places/people/event sweeps on the combined page content.
+    v2.41:
+      - NameExtractor + corpus-based filtering
+      - place extraction
+      - event extraction (with tighter military)
+      - financial sweeper
     """
-    text = data.get("content") or data.get("raw_text") or ""
+    text = (data.get("content") or data.get("raw_text") or "").strip()
     text = text if isinstance(text, str) else str(text)
 
     initial_places_raw = data.get("places") or []
@@ -1455,17 +1621,26 @@ def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(p, dict) and "name" in p:
             initial_places.append(str(p["name"]))
 
-    places_struct = sweep_places(text, initial_places)
-    people_struct = sweep_people(text)
-    events_struct = sweep_events(text, people_struct, places_struct)
+    name_extractor = NameExtractor()
+    people_raw = name_extractor.extract_names(text)
+    people = filter_people_by_stats(people_raw)
 
+    places_struct = sweep_places(text, initial_places)
+    events_struct = sweep_events(text, people, places_struct)
+    financial_struct = sweep_financial(text)
+
+    data["people"] = people
     data["places"] = places_struct
-    data["people"] = people_struct
     data["events"] = events_struct
+    if financial_struct:
+        data["financial_entries"] = financial_struct
+    else:
+        data.pop("financial_entries", None)
+
     return data
 
 # -------------------------
-# OCR per page (adaptive + quadrants, with inner threads)
+# OCR per page (adaptive + quadrants, inner threads)
 # -------------------------
 
 
@@ -1480,30 +1655,20 @@ def ocr_page(
 
     For ledger/super_dense:
       - If adaptive regions find several smaller blobs → region mode
-      - If adaptive finds one giant blob (covers most of page) → fixed 2x2 quadrant mode
+      - If adaptive finds one giant blob → fixed 2x2 quadrant mode
       - If no regions → fallback to single-call tiling
-
-    Within dense path, quadrants/regions are processed in parallel via
-    an inner ThreadPoolExecutor, but the actual OpenAI calls are serialized
-    by the global FIFO API queue.
-
-    NEW:
-    - Uses tile_is_mostly_blank(...) to skip huge empty quadrants/regions
-      (e.g. the long DISMISSED column on page 213).
     """
     w, h = im.size
     area = w * h
 
-    # ---------- Dense / ledger path ----------
     if layout_type in ("super_dense", "ledger"):
         logger.info(
-            f"Page {page}: ADAPTIVE-REGION mode (layout={layout_type}), "
-            f"size={w}x{h} ({area} px)"
+            f"Page {page}: ADAPTIVE-REGION mode (layout={layout_type}), size={w}x{h} ({area} px)"
         )
         regions = find_text_regions(im, max_regions=6, min_area_ratio=0.003, pad=20)
 
         if regions:
-            # ----- Case 1: single large region → fixed 2x2 quadrants -----
+            # Single large region → fixed 2x2 quadrants
             if len(regions) == 1:
                 x1, y1, x2, y2 = regions[0]
                 reg_area = (x2 - x1) * (y2 - y1)
@@ -1522,15 +1687,12 @@ def ocr_page(
                     max_inner_workers = min(4, n_quads)
                     with ThreadPoolExecutor(max_workers=max_inner_workers) as ex:
                         future_to_idx: Dict[Any, int] = {}
-
                         for idx, quad_img in enumerate(quadrants):
                             q_label = f"Q{idx + 1}"
 
-                            # Skip almost-empty quadrants (e.g. DISMISSED column)
                             if tile_is_mostly_blank(quad_img):
                                 logger.info(
-                                    f"Page {page}: quadrant {q_label} looks mostly blank "
-                                    f"→ skipping Vision call"
+                                    f"Page {page}: quadrant {q_label} looks mostly blank → skipping Vision call"
                                 )
                                 quadrant_results[idx] = {
                                     "page_number": page,
@@ -1547,10 +1709,7 @@ def ocr_page(
                                 }
                                 continue
 
-                                # If not blank, submit to Vision
-                            logger.info(
-                                f"Page {page}: submitting quadrant {q_label} (2x2 mode)"
-                            )
+                            logger.info(f"Page {page}: submitting quadrant {q_label} (2x2 mode)")
                             fut = ex.submit(
                                 call_vision_for_tiles,
                                 client,
@@ -1562,7 +1721,6 @@ def ocr_page(
                             )
                             future_to_idx[fut] = idx
 
-                        # Collect Vision results
                         for fut in as_completed(future_to_idx):
                             idx = future_to_idx[fut]
                             q_label = f"Q{idx + 1}"
@@ -1570,12 +1728,9 @@ def ocr_page(
                                 quadrant_results[idx] = fut.result()
                                 logger.info(f"Page {page}: quadrant {q_label} completed")
                             except Exception as e:
-                                logger.error(
-                                    f"Page {page}: quadrant {q_label} FAILED: {e}"
-                                )
+                                logger.error(f"Page {page}: quadrant {q_label} FAILED: {e}")
                                 raise
 
-                    # Merge quadrant results into a single page JSON
                     base: Optional[Dict[str, Any]] = None
                     for res in quadrant_results:
                         if res is not None:
@@ -1586,7 +1741,6 @@ def ocr_page(
 
                     merged_content_parts: List[str] = []
                     merged_raw_parts: List[str] = []
-
                     for q in quadrant_results:
                         if q is None:
                             continue
@@ -1604,10 +1758,9 @@ def ocr_page(
                     base["raw_text"] = full_raw
                     base["quadrant_label"] = None
                     base["places"] = []
-
                     return base
 
-            # ----- Case 2: multiple adaptive regions → region mode -----
+            # Multiple adaptive regions → region mode
             logger.info(f"Page {page}: using {len(regions)} adaptive region(s)")
             n_regions = len(regions)
             region_results: List[Optional[Dict[str, Any]]] = [None] * n_regions
@@ -1615,17 +1768,14 @@ def ocr_page(
             max_inner_workers = min(4, n_regions)
             with ThreadPoolExecutor(max_workers=max_inner_workers) as ex:
                 future_to_idx: Dict[Any, int] = {}
-
                 for idx, box in enumerate(regions):
                     left, top, right, bottom = box
                     q_label = f"Q{idx + 1}"
                     region_img = im.crop(box)
 
-                    # Skip almost-empty regions
                     if tile_is_mostly_blank(region_img):
                         logger.info(
-                            f"Page {page}: region {q_label} box={box} looks mostly blank "
-                            f"→ skipping Vision call"
+                            f"Page {page}: region {q_label} box={box} looks mostly blank → skipping"
                         )
                         region_results[idx] = {
                             "page_number": page,
@@ -1642,9 +1792,7 @@ def ocr_page(
                         }
                         continue
 
-                    logger.info(
-                        f"Page {page}: submitting region {q_label} box={box}"
-                    )
+                    logger.info(f"Page {page}: submitting region {q_label} box={box}")
                     fut = ex.submit(
                         call_vision_for_tiles,
                         client,
@@ -1656,7 +1804,6 @@ def ocr_page(
                     )
                     future_to_idx[fut] = idx
 
-                # Collect Vision results
                 for fut in as_completed(future_to_idx):
                     idx = future_to_idx[fut]
                     q_label = f"Q{idx + 1}"
@@ -1664,9 +1811,7 @@ def ocr_page(
                         region_results[idx] = fut.result()
                         logger.info(f"Page {page}: region {q_label} completed")
                     except Exception as e:
-                        logger.error(
-                            f"Page {page}: region {q_label} FAILED: {e}"
-                        )
+                        logger.error(f"Page {page}: region {q_label} FAILED: {e}")
                         raise
 
             base = None
@@ -1679,7 +1824,6 @@ def ocr_page(
 
             merged_content_parts: List[str] = []
             merged_raw_parts: List[str] = []
-
             for q in region_results:
                 if q is None:
                     continue
@@ -1697,7 +1841,6 @@ def ocr_page(
             base["raw_text"] = full_raw
             base["quadrant_label"] = None
             base["places"] = []
-
             return base
 
         else:
@@ -1705,7 +1848,7 @@ def ocr_page(
                 f"Page {page}: no text regions detected; falling back to SINGLE-CALL tiling."
             )
 
-    # ---------- Default / fallback single-call path ----------
+    # default / fallback
     rows, cols = LAYOUT_TILE_CONFIG["default"]
     tiles = tile_image(im, rows, cols)
     logger.info(
@@ -1722,6 +1865,7 @@ def ocr_page(
         model,
     )
     return data
+
 # -------------------------
 # Page processing + master JSONL
 # -------------------------
@@ -1737,6 +1881,10 @@ def infer_layout(area: int, width: int, height: int) -> str:
 
 
 def process_single_page(client: OpenAI, page: int) -> None:
+    """
+    v2.41: processes ONE page synchronously.
+    Any internal quadrants/regions are still handled via an inner ThreadPoolExecutor.
+    """
     try:
         logger.info(f"=== Page {page} ===")
         img_path: Optional[Path] = None
@@ -1774,10 +1922,7 @@ def process_single_page(client: OpenAI, page: int) -> None:
 
             data = ocr_page(client, page, im2, layout_type)
 
-        # scrub safety/refusal artifacts from LLM output
         data = scrub_refusals_in_data(data)
-
-        # local sweeper (places/people/events)
         data = apply_local_sweeper(data)
 
         out_path = OUTPUT_DIR / f"page-{page}.json"
@@ -1825,25 +1970,18 @@ def main() -> None:
         logger.error("[MAIN] No pages to process. Set PAGE_LIST or add PNGs to pages/")
         return
 
-    logger.info(f"Processing pages: {pages}")
+    logger.info(f"Processing pages (sequential): {pages}")
     logger.info(f"Using baseline model: {BASELINE_MODEL}, heavy model: {HEAVY_MODEL}")
     logger.info(f"dictionary_hints.json present: {HINTS_FILE.exists()}")
-    logger.info(f"Using up to {MAX_WORKERS} worker threads")
+    logger.info(f"Inner workers per page (quadrants/regions): {MAX_WORKERS}")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_page = {
-            executor.submit(process_single_page, client, page): page
-            for page in pages
-        }
-        for fut in as_completed(future_to_page):
-            p = future_to_page[fut]
-            try:
-                fut.result()
-            except Exception as e:
-                logger.error(f"[MAIN] Page {p} crashed in worker: {e}")
+    # page-at-a-time processing
+    for p in pages:
+        process_single_page(client, p)
 
     rebuild_master_jsonl()
 
 
 if __name__ == "__main__":
     main()
+
