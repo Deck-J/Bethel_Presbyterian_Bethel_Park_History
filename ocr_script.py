@@ -2,29 +2,34 @@
 # -*- coding: utf-8 -*-
 """
 Bethel OCR / ICR Pipeline
-Version: 2.41 (NameExtractor + Financial Sweeper + Stats-based Name Filter)
+Version: 2.42 (Ledger mode + NameExtractor + Financial Sweeper + Stats-based Name Filter)
 
 Features:
 - Vision OCR via OpenAI (gpt-4o-mini / gpt-4o)
 - Automatic layout density detection
-- Adaptive text-region detection via OpenCV
-- For super-dense / ledger pages:
+- Optional per-page layout overrides (page_layout_overrides.json)
+- Ledger-specific prompting and schema for attendance/dues sheets
+- Adaptive text-region detection via OpenCV for super-dense pages
+- For super-dense pages:
     * Adaptive region mode
     * If only one large region → fixed 2x2 quadrants
     * Quadrants/regions processed in parallel (inner ThreadPoolExecutor)
-- For default pages:
-    * Single Vision call on 2x3 tiles
+- For default / ledger pages:
+    * Single Vision call on tiles (ledger uses wide 1x3 tiling)
 - Strong prompts (system + user), now loaded from external files if present:
-    * prompts/ocr_system_prompt_v2.37.txt (still honored)
+    * prompts/ocr_system_prompt_v2.37.txt (default narrative)
     * prompts/ocr_user_prompt_v2.37.txt
+    * prompts/ocr_system_prompt_ledger.txt (optional ledger-specific)
+    * prompts/ocr_user_prompt_ledger.txt
 - Tolerant JSON extraction:
     * Markers, bare JSON, first {...}
     * If none → wrap raw text into minimal JSON stub
-- Local post-processing (v2.41):
+- Local post-processing (v2.42):
     * NameExtractor with statistical name filter (based on corpus + hints)
     * Place sweeper from dictionary hints
     * Event sweeper with tighter multi-war military detection
     * Financial sweeper for $ / monetary lines
+    * Ledger pages bypass sweepers (they already return structured rows)
 - Refusal / safety boilerplate scrubber on content/raw_text
 - Global FIFO queue for ALL OpenAI calls
 - Page-level processing is now sequential:
@@ -84,6 +89,8 @@ LAYOUT_OVERRIDES_PATH = BASE_DIR / "page_layout_overrides.json"
 PROMPTS_DIR = BASE_DIR / "prompts"
 SYSTEM_PROMPT_PATH = PROMPTS_DIR / "ocr_system_prompt_v2.37.txt"
 USER_PROMPT_PATH = PROMPTS_DIR / "ocr_user_prompt_v2.37.txt"
+LEDGER_SYSTEM_PROMPT_PATH = PROMPTS_DIR / "ocr_system_prompt_ledger.txt"
+LEDGER_USER_PROMPT_PATH = PROMPTS_DIR / "ocr_user_prompt_ledger.txt"
 
 BASELINE_MODEL = os.getenv("BASELINE_MODEL", "gpt-4o-mini")
 HEAVY_MODEL = os.getenv("HEAVY_MODEL", "gpt-4o")
@@ -96,11 +103,51 @@ MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "4"))
 
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "90000000"))
 
-TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.41"
+TRANSCRIPTION_VERSION = "openai-gpt-4o-vision-v2.42-ledger"
 
 LAYOUT_TILE_CONFIG = {
     "default": (2, 3),   # rows, cols
+    "ledger": (1, 3),    # wide tiling for two-page ledgers
 }
+
+# -------------------------
+# Layout overrides
+# -------------------------
+
+def load_layout_overrides() -> Dict[int, str]:
+    """
+    Optional JSON file allowing manual layout override per page.
+
+    Example page_layout_overrides.json:
+    {
+      "182": "ledger",
+      "183": "ledger",
+      "271": "super_dense"
+    }
+    """
+    if not LAYOUT_OVERRIDES_PATH.exists():
+        logger.info("[LAYOUT_OVERRIDES] No page_layout_overrides.json – using inferred layouts only")
+        return {}
+    try:
+        with LAYOUT_OVERRIDES_PATH.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        overrides: Dict[int, str] = {}
+        for k, v in raw.items():
+            try:
+                page = int(k)
+            except ValueError:
+                continue
+            v_norm = str(v).strip().lower()
+            if v_norm not in {"default", "ledger", "super_dense"}:
+                continue
+            overrides[page] = v_norm
+        logger.info(f"[LAYOUT_OVERRIDES] Loaded overrides for pages: {sorted(overrides.keys())}")
+        return overrides
+    except Exception as e:
+        logger.error(f"[LAYOUT_OVERRIDES] Failed to load {LAYOUT_OVERRIDES_PATH}: {e}")
+        return {}
+
+LAYOUT_OVERRIDES = load_layout_overrides()
 
 # -------------------------
 # Global FIFO API queue
@@ -343,7 +390,6 @@ def build_name_stats() -> Dict[str, Set[str]]:
             continue
         toks = nm.split()
         if len(toks) == 1:
-            # ambiguous, treat as surname first
             _add_name("", None, toks[0])
         else:
             given = toks[0]
@@ -594,11 +640,86 @@ def find_text_regions(
 # -------------------------
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(layout_type: str = "default") -> str:
     """
     Load system prompt from external file if present, otherwise fall back
     to inline prompt that also injects dictionary hints.
+
+    For layout_type == "ledger", we try ledger-specific prompt file first,
+    then fall back to a built-in ledger prompt.
     """
+    # Ledger-specific
+    if layout_type == "ledger":
+        if LEDGER_SYSTEM_PROMPT_PATH.exists():
+            try:
+                text = LEDGER_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+                logger.info(f"[PROMPTS] Using external LEDGER system prompt: {LEDGER_SYSTEM_PROMPT_PATH}")
+                return text
+            except Exception as e:
+                logger.warning(f"[PROMPTS] Failed to read ledger system prompt file: {e}")
+
+        logger.info("[PROMPTS] Using built-in LEDGER system prompt fallback")
+        return """
+You are a professional paleographer specializing in 19th-century handwritten ledger books.
+
+The input image is a MEMBER CHECKLIST LEDGER (attendance / dues ledger) from a Presbyterian church society.
+
+Critical rules:
+- DO NOT treat the page as narrative text.
+- DO NOT unwrap columnar text into paragraphs.
+- You MUST extract the ledger as ROWS with COLUMN HEADERS.
+- Every row corresponds to ONE PERSON (one member's name).
+- Every column from the header corresponds to ONE MONTH or ONE CATEGORY.
+- Checkmarks, slashes, crosses, dots or any ink mark in a cell count as “present”.
+- Empty cells count as “absent”.
+- The image tiles you see belong to ONE two-page spread. You MUST mentally stitch them into a single table.
+
+You MUST output the ledger in JSON with at least this structure:
+
+{
+  "page_number": <int>,
+  "page_type": "ledger",
+  "ledger_title": <string or null>,
+  "record_type": "attendance_ledger",
+  "page_date_hint": <string or null>,
+  "transcription_method": "openai-gpt-4o-vision-v2.42-ledger",
+  "transcription_quality": "high" | "medium" | "low",
+  "columns": [ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" ],
+  "rows": [
+    {
+      "name": "Mrs. W. R. Wycoff",
+      "marks": {
+        "Jan": "✓",
+        "Feb": "",
+        "Mar": "✓",
+        "Apr": "",
+        "May": "✓",
+        "Jun": "",
+        "Jul": "",
+        "Aug": "",
+        "Sep": "",
+        "Oct": "",
+        "Nov": "",
+        "Dec": ""
+      },
+      "notes": null
+    }
+  ],
+  "notes": <string or null>
+}
+
+Rules for marks:
+- If any kind of mark appears in a cell → output "✓".
+- If the cell is clearly empty → output "" (empty string).
+- If the cell is illegible or cut off → output "?".
+- If some months are only on the right-hand page, still include them as columns.
+
+Never output text outside JSON.
+Never apologize.
+Never produce safety warnings.
+""".strip()
+
+    # Non-ledger: normal narrative / mixed pages
     if SYSTEM_PROMPT_PATH.exists():
         try:
             text = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
@@ -613,7 +734,7 @@ def build_system_prompt() -> str:
     military_str = ", ".join(COMBINED_MILITARY[:80])
     honorifics_str = ", ".join(ALL_HONORIFICS)
 
-    logger.info("[PROMPTS] Using built-in system prompt fallback")
+    logger.info("[PROMPTS] Using built-in system prompt fallback (narrative)")
 
     return f"""
 You are an expert historical paleographer and archivist working on PUBLIC DOMAIN
@@ -691,8 +812,59 @@ def build_user_prompt(page_number: int, layout_type: str, quadrant_label: Option
     Load user prompt template from external file if present, otherwise fall back
     to inline prompt. External template can use {{page_number}}, {{layout_type}},
     {{quadrant_label}} placeholders.
+
+    For ledger layout, we prefer ledger-specific user prompt if present.
     """
     q_label_text = f"(quadrant {quadrant_label})" if quadrant_label else ""
+
+    # Ledger-specific user prompt
+    if layout_type == "ledger":
+        if LEDGER_USER_PROMPT_PATH.exists():
+            try:
+                tmpl = LEDGER_USER_PROMPT_PATH.read_text(encoding="utf-8")
+                logger.info(f"[PROMPTS] Using external LEDGER user prompt: {LEDGER_USER_PROMPT_PATH}")
+                tmpl = tmpl.replace("{{page_number}}", str(page_number))
+                tmpl = tmpl.replace("{{layout_type}}", layout_type)
+                tmpl = tmpl.replace("{{quadrant_label}}", q_label_text)
+                return tmpl
+            except Exception as e:
+                logger.warning(f"[PROMPTS] Failed to read ledger user prompt file: {e}")
+
+        logger.info("[PROMPTS] Using built-in LEDGER user prompt fallback")
+        return f"""
+You are transcribing a two-page attendance / dues ledger (page {page_number}) of a bound church record volume.
+
+CONTEXT:
+- PUBLIC-DOMAIN historical ledgers from the 1800s.
+- All people mentioned are long deceased.
+- No modern personal data or privacy risk.
+- Do NOT refuse. Do NOT apologize. Do NOT output safety warnings.
+
+LAYOUT:
+- Layout classification: "{layout_type}".
+- The images you see are all tiles from THIS SAME two-page ledger spread (left and right pages together).
+- These tiles are NOT separate pages. You MUST mentally stitch them into ONE continuous ledger table.
+
+TASK:
+1) Carefully read ALL tiles.
+2) Identify the ledger title at the top (e.g., "Names of all Regularly Constituted Members of this Society for 1889").
+3) Identify the left-hand name column: each row is one person's name.
+4) Identify all column headers across the whole spread (months, dues, etc.).
+5) Align each row horizontally across the grid.
+6) For each cell, decide:
+   - "✓" if there is any mark (slash, check, dot, cross) in that cell.
+   - "" if clearly empty.
+   - "?" if illegible or cut off.
+7) Output EXACTLY one JSON object following the LEDGER schema from the system prompt.
+
+Output MUST be wrapped between:
+
+---BEGIN_JSON---
+{{ ... }}
+---END_JSON---
+""".strip()
+
+    # Non-ledger user prompt (narrative / mixed pages)
     if USER_PROMPT_PATH.exists():
         try:
             tmpl = USER_PROMPT_PATH.read_text(encoding="utf-8")
@@ -704,7 +876,7 @@ def build_user_prompt(page_number: int, layout_type: str, quadrant_label: Option
         except Exception as e:
             logger.warning(f"[PROMPTS] Failed to read user prompt file: {e}")
 
-    logger.info("[PROMPTS] Using built-in user prompt fallback")
+    logger.info("[PROMPTS] Using built-in user prompt fallback (narrative)")
     q_part = f"quadrant/region {quadrant_label} of " if quadrant_label else ""
     return f"""
 You are transcribing {q_part}page {page_number} of a bound church record volume.
@@ -921,7 +1093,7 @@ def call_vision_for_tiles(
     """
     start_global_api_worker(client)
 
-    sys_prompt = build_system_prompt()
+    sys_prompt = build_system_prompt(layout_type)
     user_prompt = build_user_prompt(page_number, layout_type, quadrant_label)
 
     message_content: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
@@ -940,23 +1112,54 @@ def call_vision_for_tiles(
     ]
 
     label = quadrant_label or "whole-page"
-    logger.info(f"Page {page_number} {label}: enqueuing API call with {len(tiles)} tile(s)")
+    logger.info(f"Page {page_number} {label}: enqueuing API call with {len(tiles)} tile(s) [layout={layout_type}]")
 
     def _task():
         logger.info(f"Page {page_number} {label}: starting API call (in worker)")
         resp = _do_openai_call(client, model, messages)
         msg = resp.choices[0].message
 
+        assistant_text = ""
+
+        # Case 1: simple string content
         if isinstance(msg.content, str):
-            assistant_text = msg.content
-        else:
+            assistant_text = msg.content or ""
+
+        # Case 2: list-of-parts content (newer SDK behaviour)
+        elif isinstance(msg.content, list):
             parts_text: List[str] = []
             for part in msg.content:
-                if getattr(part, "type", None) == "text":
-                    parts_text.append(part.text)
-            assistant_text = "".join(parts_text)
-        return assistant_text.strip()
+                # `part` may be a pydantic object or a dict
+                ptype = getattr(part, "type", None)
+                if ptype is None and isinstance(part, dict):
+                    ptype = part.get("type")
 
+                if ptype == "text":
+                    text_val = getattr(part, "text", None)
+                    if text_val is None and isinstance(part, dict):
+                        text_val = part.get("text", "")
+                    if text_val:
+                        parts_text.append(str(text_val))
+            assistant_text = "".join(parts_text)
+
+        # Case 3: None or unexpected type → log and fall back
+        else:
+            logger.warning(
+                f"[VISION] Unexpected message.content type={type(msg.content)} "
+                f"for page {page_number} {label}; treating as empty string."
+            )
+            assistant_text = ""
+
+        assistant_text = (assistant_text or "").strip()
+
+        if not assistant_text:
+            # Optional: dump the raw response structure for debugging
+            logger.warning(
+                f"[VISION] Empty assistant_text for page {page_number} {label}; "
+                f"raw message: {msg}"
+            )
+
+        return assistant_text
     assistant_text = ""
     try:
         assistant_text = enqueue_api_call(_task)
@@ -987,7 +1190,7 @@ def call_vision_for_tiles(
         raise
 
 # -------------------------
-# Name / Event / Financial sweepers (v2.41)
+# Name / Event / Financial sweepers (v2.42)
 # -------------------------
 
 MONTH_TOKENS = {
@@ -1264,7 +1467,6 @@ class NameExtractor:
                 if self.is_surname_prefix(surname_prefix):
                     full_surname = f"{surname_prefix} {surname}"
                 else:
-                    # avoid triple-name weirdness that often isn't a person
                     continue
 
             initials: List[str] = []
@@ -1358,10 +1560,8 @@ def filter_people_by_stats(people: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             score += 1
 
         if score == 0:
-            # very conservative: drop unknown 2-token names
             if len(full.split()) <= 3:
                 continue
-            # for longer names (multi-initial combos) keep but lower confidence
             p["confidence"] = min(p.get("confidence", 0.85), 0.6)
         filtered.append(p)
 
@@ -1384,7 +1584,6 @@ def sweep_places(text: str, initial_places: List[str]) -> List[Dict[str, Any]]:
             continue
         found.setdefault(p, "")
 
-    # basic "X Township" / "X County"
     township_re = re.compile(
         r"\b([A-Z][a-zA-Z]+)\s+(Township|Tp\.|Tp|Twp\.|Twp|Twsp\.|Twsp)\b"
     )
@@ -1414,7 +1613,6 @@ def _extract_year_from_string(s: str) -> Optional[int]:
 
 MILITARY_RANK_TOKENS = [r.lower().rstrip(".") for r in HONORIFICS_MILITARY]
 
-# more conservative core military cues
 MILITARY_CORE_PATTERNS = [
     r"\bcivil war\b",
     r"\brevolutionary war\b",
@@ -1449,7 +1647,6 @@ def is_military_sentence(lowered: str) -> bool:
             return True
     if any(rank in lowered for rank in MILITARY_RANK_TOKENS):
         return True
-    # allow hints as backup, but only when "war" or "battle" is present
     if "war" in lowered or "battle" in lowered:
         for kw in COMBINED_MILITARY:
             if kw.lower() in lowered:
@@ -1508,7 +1705,6 @@ def sweep_events(
                 place_for_event = pl
                 break
 
-        # link by surname first
         people_for_event: Dict[str, Dict[str, Any]] = {}
         for person in people:
             full = person.get("full_name") or ""
@@ -1604,12 +1800,19 @@ def sweep_financial(text: str) -> List[Dict[str, Any]]:
 
 def apply_local_sweeper(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    v2.41:
-      - NameExtractor + corpus-based filtering
+    v2.42:
+      - NameExtractor + corpus-based filtering for narrative/mixed pages
       - place extraction
       - event extraction (with tighter military)
       - financial sweeper
+      - IMPORTANT: ledger pages are returned as-is (we do not run sweepers).
     """
+    page_type = (data.get("page_type") or "").lower()
+
+    # Ledger pages already have structured rows/columns; avoid over-processing.
+    if page_type == "ledger":
+        return data
+
     text = (data.get("content") or data.get("raw_text") or "").strip()
     text = text if isinstance(text, str) else str(text)
 
@@ -1651,24 +1854,24 @@ def ocr_page(
     layout_type: str,
 ) -> Dict[str, Any]:
     """
-    For default layout: one call with tiled page (2x3).
+    For default / ledger layout: one call with tiled page (layout-specific tiling).
 
-    For ledger/super_dense:
+    For super_dense:
       - If adaptive regions find several smaller blobs → region mode
-      - If adaptive finds one giant blob → fixed 2x2 quadrant mode
+      - If adaptive finds one giant blob → fixed 2x2 quadrants
       - If no regions → fallback to single-call tiling
     """
     w, h = im.size
     area = w * h
 
-    if layout_type in ("super_dense", "ledger"):
+    # Only super_dense uses adaptive regions/quadrants.
+    if layout_type == "super_dense":
         logger.info(
             f"Page {page}: ADAPTIVE-REGION mode (layout={layout_type}), size={w}x{h} ({area} px)"
         )
         regions = find_text_regions(im, max_regions=6, min_area_ratio=0.003, pad=20)
 
         if regions:
-            # Single large region → fixed 2x2 quadrants
             if len(regions) == 1:
                 x1, y1, x2, y2 = regions[0]
                 reg_area = (x2 - x1) * (y2 - y1)
@@ -1760,7 +1963,6 @@ def ocr_page(
                     base["places"] = []
                     return base
 
-            # Multiple adaptive regions → region mode
             logger.info(f"Page {page}: using {len(regions)} adaptive region(s)")
             n_regions = len(regions)
             region_results: List[Optional[Dict[str, Any]]] = [None] * n_regions
@@ -1848,8 +2050,8 @@ def ocr_page(
                 f"Page {page}: no text regions detected; falling back to SINGLE-CALL tiling."
             )
 
-    # default / fallback
-    rows, cols = LAYOUT_TILE_CONFIG["default"]
+    # default / ledger fallback: SINGLE-CALL tiling with layout-specific tile grid
+    rows, cols = LAYOUT_TILE_CONFIG.get(layout_type, LAYOUT_TILE_CONFIG["default"])
     tiles = tile_image(im, rows, cols)
     logger.info(
         f"Page {page}: SINGLE-CALL mode layout={layout_type}, "
@@ -1882,7 +2084,7 @@ def infer_layout(area: int, width: int, height: int) -> str:
 
 def process_single_page(client: OpenAI, page: int) -> None:
     """
-    v2.41: processes ONE page synchronously.
+    v2.42: processes ONE page synchronously.
     Any internal quadrants/regions are still handled via an inner ThreadPoolExecutor.
     """
     try:
@@ -1908,7 +2110,16 @@ def process_single_page(client: OpenAI, page: int) -> None:
             im.load()
             orig_w, orig_h = im.size
             area = orig_w * orig_h
+
+            # First infer layout, then apply overrides if present
             layout_type = infer_layout(area, orig_w, orig_h)
+            if page in LAYOUT_OVERRIDES:
+                logger.info(
+                    f"[LAYOUT_OVERRIDES] Page {page}: overriding inferred layout "
+                    f"'{layout_type}' → '{LAYOUT_OVERRIDES[page]}'"
+                )
+                layout_type = LAYOUT_OVERRIDES[page]
+
             logger.info(
                 f"Page {page} → layout={layout_type}, size={orig_w}x{orig_h} ({area} px)"
             )
@@ -1975,7 +2186,6 @@ def main() -> None:
     logger.info(f"dictionary_hints.json present: {HINTS_FILE.exists()}")
     logger.info(f"Inner workers per page (quadrants/regions): {MAX_WORKERS}")
 
-    # page-at-a-time processing
     for p in pages:
         process_single_page(client, p)
 
